@@ -762,8 +762,10 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             return "ok"
         # Признак владельца (приоритетный слот): токен в URL/cookie/заголовке.
         is_owner, url_tok = self._is_owner_request()
-        if url_tok:
-            # Токен пришёл в URL — запомним в cookie (и почистим URL в GET "/").
+        if url_tok and is_owner:
+            # КОРРЕКТНЫЙ токен пришёл в URL — запомним в cookie и почистим
+            # адресную строку (в GET "/"). Неверный токен НЕ запоминаем:
+            # иначе нам бы выставляли cookie/редиректили на мусорный owner.
             self._pending_owner_cookie = url_tok
         sid = self._read_sid_cookie()
         if not allow_new and not sid:
