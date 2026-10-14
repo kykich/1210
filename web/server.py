@@ -663,6 +663,8 @@ class WebRequestHandler(BaseHTTPRequestHandler):
     # обращение к self._pending_sid в _do_GET падало с AttributeError -> 502.
     _pending_sid = None
     _cookie_to_set = None
+    # Токен владельца, пришедший в URL (?owner=…): выставляем cookie owner.
+    _pending_owner_cookie = None
     # _RTK_VPS_SESSIONS2
 
     @property
@@ -707,14 +709,46 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             pass
         return True
 
-    def _read_sid_cookie(self):
-        """Читает cookie sid из заголовка Cookie."""
+    def _read_cookie(self, name):
+        """Читает указанный cookie из заголовка Cookie (или None)."""
         raw = self.headers.get("Cookie", "")
         for part in raw.split(";"):
             kv = part.strip().split("=", 1)
-            if len(kv) == 2 and kv[0].strip() == "sid":
+            if len(kv) == 2 and kv[0].strip() == name:
                 return kv[1].strip()
         return None
+
+    def _read_sid_cookie(self):
+        """Читает cookie sid из заголовка Cookie."""
+        return self._read_cookie("sid")
+
+    def _is_owner_request(self):
+        """Проверяет, что запрос — от ВЛАДЕЛЬЦА (приоритетный слот).
+
+        Признак владельца — СЕКРЕТНЫЙ ТОКЕН, заданный в ENV (RTK_OWNER_TOKEN).
+        Токен может прийти тремя путями:
+          * в URL: ?owner=<ТОКЕН> (первое открытие ссылки владельцем);
+          * в cookie owner=<ТОКЕН> (браузер запомнил после редиректа);
+          * в заголовке X-Owner-Token (для скриптов/curl).
+        Возвращает (is_owner, token_from_url). token_from_url непустой,
+        если токен пришёл в URL — тогда сервер выставит cookie и очистит URL.
+        """
+        want = str(getattr(config, "OWNER_TOKEN", "") or "")
+        if not want:
+            return (False, None)
+        import urllib.parse
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        url_tok = (q.get("owner", [""])[0] or "").strip()
+        if url_tok:
+            return (url_tok == want, url_tok)
+        cookie_tok = (self._read_cookie(getattr(config, "OWNER_COOKIE", "owner"))
+                      or "").strip()
+        if cookie_tok:
+            return (cookie_tok == want, None)
+        hdr = (self.headers.get("X-Owner-Token") or "").strip()
+        if hdr:
+            return (hdr == want, None)
+        return (False, None)
 
     def _resolve_session(self, is_activity=True, allow_new=True):
         """Привязывает запрос к клиентской сессии по cookie sid.
@@ -726,12 +760,18 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         if not getattr(config, "MAX_SESSIONS", 0):
             self._session_obj = None
             return "ok"
+        # Признак владельца (приоритетный слот): токен в URL/cookie/заголовке.
+        is_owner, url_tok = self._is_owner_request()
+        if url_tok:
+            # Токен пришёл в URL — запомним в cookie (и почистим URL в GET "/").
+            self._pending_owner_cookie = url_tok
         sid = self._read_sid_cookie()
         if not allow_new and not sid:
             self._session_obj = None
             return "ok"
         mgr = _ServerState._RTK_VPS_SESSIONS
-        kind, sess = mgr.touch(sid, is_activity=is_activity)
+        kind, sess = mgr.touch(sid, is_activity=is_activity,
+                               privileged=is_owner)
         if kind in ("ok", "new") and sess is not None:
             if kind == "new":
                 # sid мог быть сгенерирован менеджером (cookie не было).
@@ -750,6 +790,13 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Set-Cookie",
             "sid=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400" % sid)
+
+    def _set_owner_cookie(self, token):
+        """Запоминает владельца в cookie (после открытия ?owner=<ТОКЕН>)."""
+        self.send_header(
+            "Set-Cookie",
+            "%s=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000"
+            % (getattr(config, "OWNER_COOKIE", "owner"), token))
 
     def _send_full(self):
         """Заглушка «нет свободной сессии» (HTTP 503)."""
@@ -836,6 +883,21 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         import urllib.parse
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         if path in ("/", "/index.html"):
+            # Токен владельца пришёл в URL (?owner=…): запомним в cookie и
+            # ОЧИСТИМ адресную строку (редирект на "/"), чтобы секрет не
+            # оставался виден в истории браузера/Referer.
+            if self._pending_owner_cookie:
+                self._set_owner_cookie(self._pending_owner_cookie)
+                self._pending_owner_cookie = None
+                self.send_response(302)
+                self.send_header("Location", "/")
+                ck = getattr(self, "_cookie_to_set", None)
+                if ck:
+                    self._set_sid_cookie(ck)
+                    self._cookie_to_set = None
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             # Новой клиентской сессии выдаём cookie sid до отправки.
             if self._pending_sid:
                 self._cookie_to_set = self._pending_sid
@@ -960,6 +1022,11 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         if ck:
             self._set_sid_cookie(ck)
             self._cookie_to_set = None
+        # Токен владельца, пришедший в URL (?owner=…): запоминаем в cookie.
+        otk = getattr(self, "_pending_owner_cookie", None)
+        if otk:
+            self._set_owner_cookie(otk)
+            self._pending_owner_cookie = None
         self.send_header("Content-Type", ctype or "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

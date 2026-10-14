@@ -27,6 +27,7 @@ VPS (Ubuntu 25.10, 2 vCPU / 4 ГБ, без GPU). Полное ТЗ — в
 | Возможность | Где | Пункт ТЗ |
 |---|---|---|
 | Лимит активных сессий = 4 + заглушка 503 | `web/session_manager.py`, `web/server.py` | §5.1, §5.3 |
+| Приоритетный слот владельца (`RTK_OWNER_TOKEN`) | `web/session_manager.py`, `web/server.py` | §5.3 |
 | Сессия на клиента (cookie `sid`, изоляция) | `web/session_manager.py` | §5.2 |
 | Автомат `ACTIVE→CHECK→OFFLINE`, фоновая очистка | `web/session_manager.py` | §5.1, §5.3 |
 | `/api/heartbeat`, `/api/health` | `web/server.py` | §5.4, §8.2 |
@@ -83,8 +84,9 @@ curl -sk https://<IP>:8443/ | head
 | `RTK_PORT` | `8000` | порт app |
 | `RTK_BEHIND_PROXY` | `0` | доверять `X-Forwarded-For` (за nginx = 1) |
 | `RTK_MAX_SESSIONS` | `2` | лимит активных сессий (0 = выключить) |
-| `RTK_IDLE_TIMEOUT` | `300` | секунд тишины → `CHECK` |
-| `RTK_CHECK_TIMEOUT` | `60` | секунд без ответа → `OFFLINE` |
+| `RTK_IDLE_TIMEOUT` | `60` | секунд тишины → `CHECK` |
+| `RTK_CHECK_TIMEOUT` | `30` | секунд без ответа → `OFFLINE` |
+| `RTK_OWNER_TOKEN` | *(пусто)* | секрет владельца: владелец открывает `/?owner=<токен>` и всегда получает слот (пусто = приоритет выключен) |
 | `RTK_RATE_LIMIT_PER_MIN` | `10` | запросов/мин на IP (0 = выключить) |
 | `RTK_SKIP_KEY_CHECK` | `0` | не проверять ключи облачных моделей |
 | `RTK_CHECK_NETWORK` | `1` | сетевые проверки при самодиагностике |

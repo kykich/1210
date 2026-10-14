@@ -30,10 +30,15 @@ Environment=RTK_PORT=8000
 Environment=RTK_BEHIND_PROXY=1
 Environment=RTK_OPEN_BROWSER=0
 Environment=RTK_MAX_SESSIONS=4
-Environment=RTK_IDLE_TIMEOUT=300
-Environment=RTK_CHECK_TIMEOUT=60
+Environment=RTK_IDLE_TIMEOUT=60
+Environment=RTK_CHECK_TIMEOUT=30
 # Rate limit НЕ задаём здесь: им управляет /etc/rtk/rtk-web.env
 # (Environment= переопределял бы EnvironmentFile). Дефолт — 10/мин.
+#
+# ПРИОРИТЕТ ВЛАДЕЛЬЦА: задайте RTK_OWNER_TOKEN=<секрет> в /etc/rtk/rtk-web.env
+# (НЕ в этом файле и НЕ в git!). Владелец открывает сайт со ссылкой
+# http://<IP>/?owner=<секрет> — его браузер запоминает cookie, и ему всегда
+# находится слот (при нехватке вытесняется самая старая чужая сессия).
 Environment=RTK_SKIP_KEY_CHECK=1
 Environment=RTK_CHECK_NETWORK=0
 Environment=RTK_LOCAL_HOST=127.0.0.1

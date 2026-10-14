@@ -37,13 +37,16 @@ OFFLINE = "offline"    # отключена: слот свободен, стра
 class Session:
     """Одна клиентская сессия: стор + состояние + таймстемпы."""
 
-    def __init__(self, sid, store):
+    def __init__(self, sid, store, privileged=False):
         self.sid = sid
         self.store = store
         self.state = ACTIVE
         self.last_seen = time.time()      # последняя РЕАЛЬНАЯ активность
         self.check_at = None              # когда перешли в CHECK (дедлайн = +CHECK_TIMEOUT)
         self.created = time.time()
+        # Владелец (приоритетный слот): такую сессию НЕ вытесняем, и ей
+        # всегда находится место, даже когда лимит исчерпан (см. touch()).
+        self.privileged = bool(privileged)
 
     def deadline(self):
         """Момент дедлайна в CHECK (epoch) или None."""
@@ -86,19 +89,39 @@ class SessionManager:
         safe = "".join(ch for ch in sid if ch.isalnum() or ch in "-_")[:64]
         return os.path.join(self.session_dir, "s_%s.json" % safe)
 
-    def _new_session_locked(self, sid):
+    def _new_session_locked(self, sid, privileged=False):
         """Создаёт сессию и её стор (вызывать под self._lock)."""
         store = SessionStore(path=self._store_path(sid))
-        s = Session(sid, store)
+        s = Session(sid, store, privileged=privileged)
         self._sessions[sid] = s
         return s
 
     def _active_count_locked(self):
         return sum(1 for s in self._sessions.values() if s.state != OFFLINE)
 
+    def _evict_one_locked(self, now):
+        """Вытесняет ОДНУ НЕпривилегированную сессию (самую старую).
+
+        Используется для приоритетного слота владельца: если мест нет, но
+        запрос привилегированный — освобождаем слот, переводя в OFFLINE
+        самую давно неактивную обычную сессию. Владельческие сессии не
+        трогаем. Возвращает True, если слот освобождён.
+        """
+        victims = [s for s in self._sessions.values()
+                   if s.state != OFFLINE and not s.privileged]
+        if not victims:
+            return False
+        # Самая старая по последней активности (last_seen).
+        victim = min(victims, key=lambda s: s.last_seen)
+        self._offline_seen[victim.sid] = now
+        del self._sessions[victim.sid]
+        print("[SESSION] вытеснена обычная сессия %s ради владельца, "
+              "слот свободен" % victim.sid, flush=True)
+        return True
+
     # ---------------- Публичный API ----------------
 
-    def touch(self, sid, is_activity=True):
+    def touch(self, sid, is_activity=True, privileged=False):
         """Точка входа при запросе с cookie ``sid``.
 
         Возвращает (kind, session):
@@ -109,12 +132,17 @@ class SessionManager:
 
         is_activity=False — «тихий» запрос (например /api/heartbeat): НЕ
         продлевает сессию и НЕ переводит её из CHECK, но возвращает состояние.
+
+        privileged=True — запрос от ВЛАДЕЛЬЦА (приоритетный): если мест нет,
+        вытесняется одна обычная сессия, чтобы владельцу всегда нашёлся слот.
         """
         now = time.time()
         with self._lock:
             self._gc_locked(now)
             s = self._sessions.get(sid) if sid else None
             if s is not None:
+                if privileged:
+                    s.privileged = True
                 if is_activity and s.state in (ACTIVE, CHECK):
                     # Реальный запрос продлевает: CHECK/ACTIVE -> ACTIVE.
                     s.state = ACTIVE
@@ -126,9 +154,13 @@ class SessionManager:
                 return ("offline", None)
             # Новый клиент: есть ли слот?
             if self._active_count_locked() >= self.max_sessions:
-                return ("full", None)
+                # Владельцу всегда освобождаем слот (вытесняем обычную сессию).
+                if privileged and self._evict_one_locked(now):
+                    pass
+                else:
+                    return ("full", None)
             new_sid = sid or self._gen_sid_locked()
-            s = self._new_session_locked(new_sid)
+            s = self._new_session_locked(new_sid, privileged=privileged)
             s.last_seen = now
             return ("new", s)
 
