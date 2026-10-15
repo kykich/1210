@@ -830,19 +830,23 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             pass
 
 
-    def _send_bytes(self, status, body, content_type):
+    def _send_bytes(self, status, body, content_type, set_sid=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(status)
+        # Новый cookie sid (ротация слота владельца / выдача нового слота).
+        if set_sid:
+            self._set_sid_cookie(set_sid)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_json(self, status, obj):
+    def _send_json(self, status, obj, set_sid=None):
         payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self._send_bytes(status, payload, "application/json; charset=utf-8")
+        self._send_bytes(status, payload, "application/json; charset=utf-8",
+                         set_sid=set_sid)
 
     def _read_json_body(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -889,10 +893,14 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             # ОЧИСТИМ адресную строку (редирект на "/"), чтобы секрет не
             # оставался виден в истории браузера/Referer.
             if self._pending_owner_cookie:
-                self._set_owner_cookie(self._pending_owner_cookie)
-                self._pending_owner_cookie = None
+                # ВАЖНО: send_response() ОБЯЗАТЕЛЕН до send_header(). Если
+                # вызвать send_header() раньше, BaseHTTPRequestHandler пишет
+                # заголовок в пустой буфер, и клиент получает битую строку
+                # статуса (BadStatusLine: «Set-Cookie …» вместо «HTTP/1.1 302»).
                 self.send_response(302)
                 self.send_header("Location", "/")
+                self._set_owner_cookie(self._pending_owner_cookie)
+                self._pending_owner_cookie = None
                 ck = getattr(self, "_cookie_to_set", None)
                 if ck:
                     self._set_sid_cookie(ck)
@@ -964,6 +972,15 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         import urllib.parse
         if self._rate_limited():
             return
+        path = urllib.parse.urlparse(self.path).path
+        # /api/newchat обрабатывается ОСОБО: он должен уметь работать даже
+        # когда текущая сессия «offline» (кнопка «Начать новую сессию») —
+        # поэтому не блокируем его offline-проверкой, а ротацию слота делаем
+        # внутри _handle_newchat. /api/newslot — старый алиас (ротация слота).
+        if path == "/api/newchat":
+            return self._handle_newchat()
+        if path == "/api/newslot":
+            return self._handle_newchat(force_renew=True)
         kind = self._resolve_session(is_activity=True, allow_new=True)
         if kind == "full":
             return self._send_json(503, {"ok": False,
@@ -978,10 +995,6 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         import urllib.parse
         if urllib.parse.urlparse(self.path).path == "/api/ask":
             return self._handle_ask()
-        if urllib.parse.urlparse(self.path).path == "/api/newchat":
-            self.session.reset()
-            return self._send_json(200, {"ok": True,
-                                         "messages": self.session.snapshot()})
         if urllib.parse.urlparse(self.path).path == "/api/compact":
             return self._handle_compact()
         if urllib.parse.urlparse(self.path).path == "/api/compact_summary":
@@ -1120,6 +1133,44 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             # Сжатие не должно ломать основной запрос.
             print("[COMPACT] сжатие не удалось: %s" % exc, flush=True)
+
+    def _handle_newchat(self, force_renew=False):
+        """POST /api/newchat — новый разговор.
+
+        Два режима:
+          * обычный (``{"renew": false}`` или пустое тело) — просто очищаем
+            историю ТЕКУЩЕЙ сессии (кнопка «Новый разговор»);
+          * РОТАЦИЯ (``{"renew": true}``) — выдаём НОВЫЙ cookie sid и
+            ОСВОБОЖДАЕМ прежний слот. Используется для кнопки «Начать новую
+            сессию» и при ОБНОВЛЕНИИ страницы (чтобы обновление не плодило
+            «мёртвые» слоты). Владельцу при нехватке мест слот находится
+            приоритетно (вытесняется самая старая обычная сессия).
+
+        force_renew=True — принудительная ротация (старый алиас /api/newslot).
+        """
+        data = self._read_json_body() or {}
+        renew = force_renew or bool(data.get("renew"))
+        if not renew or not getattr(config, "MAX_SESSIONS", 0):
+            # Обычный сброс истории в текущей сессии.
+            self.session.reset()
+            return self._send_json(200, {"ok": True,
+                                         "messages": self.session.snapshot()})
+        # РОТАЦИЯ слота: новый sid взамен старого (старый освобождается).
+        is_owner, _ = self._is_owner_request()
+        mgr = _ServerState._RTK_VPS_SESSIONS
+        old_sid = self._read_sid_cookie()
+        kind, sid = mgr.new_slot(old_sid=old_sid, privileged=is_owner)
+        if kind != "new" or not sid:
+            # Мест нет даже для обычной ротации: просим показать заглушку.
+            return self._send_json(503, {"ok": False,
+                "error": "Нет свободной сессии.", "state": "full"})
+        # Привязываем запрос к НОВОЙ сессии (её стор) и ставим новый cookie.
+        self._sid = sid
+        self._session_obj = mgr.store_for(sid)
+        self.session.reset()
+        return self._send_json(200, {"ok": True, "renewed": True,
+                                     "messages": self.session.snapshot()},
+                               set_sid=sid)
 
     def _handle_ask(self):
         """Принимает запрос пользователя и передаёт его агенту.

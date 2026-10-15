@@ -135,6 +135,9 @@ class SessionManager:
 
         privileged=True — запрос от ВЛАДЕЛЬЦА (приоритетный): если мест нет,
         вытесняется одна обычная сессия, чтобы владельцу всегда нашёлся слот.
+        Владельцу, чья прежняя сессия ушла в OFFLINE, сразу выдаётся НОВАЯ
+        привилегированная сессия (а не «offline»-экран) — чтобы он никогда не
+        упирался в лимит.
         """
         now = time.time()
         with self._lock:
@@ -151,7 +154,11 @@ class SessionManager:
                 return ("ok", s)
             # Сессии нет. Была отключена ранее?
             if sid and sid in self._offline_seen:
-                return ("offline", None)
+                # ВЛАДЕЛЬЦУ offline не показываем: сразу выдаём новый
+                # привилегированный слот (освобождая память о старом sid).
+                if not privileged:
+                    return ("offline", None)
+                self._offline_seen.pop(sid, None)
             # Новый клиент: есть ли слот?
             if self._active_count_locked() >= self.max_sessions:
                 # Владельцу всегда освобождаем слот (вытесняем обычную сессию).
@@ -159,10 +166,21 @@ class SessionManager:
                     pass
                 else:
                     return ("full", None)
+            # Если клиент пришёл с конкретным sid (cookie) — используем его;
+            # иначе генерируем новый.
             new_sid = sid or self._gen_sid_locked()
+            if new_sid in self._sessions:
+                new_sid = self._gen_sid_locked()
             s = self._new_session_locked(new_sid, privileged=privileged)
             s.last_seen = now
             return ("new", s)
+
+    def store_for(self, sid):
+        """Возвращает SessionStore для sid (или None) — для привязки запроса
+        после ротации слота (new_slot)."""
+        with self._lock:
+            s = self._sessions.get(sid) if sid else None
+            return s.store if s is not None else None
 
     def heartbeat(self, sid):
         """Состояние сессии для клиента (без продления).
@@ -180,24 +198,34 @@ class SessionManager:
                         "check_timeout": config.CHECK_TIMEOUT}
             return s.snapshot()
 
-    def new_slot(self, old_sid=None):
-        """Пытается выдать НОВУЮ сессию взамен отключённой (кнопка «Начать
-        новую сессию»).
+    def new_slot(self, old_sid=None, privileged=False):
+        """Выдаёт НОВУЮ сессию взамен старой/отключённой.
+
+        Используется кнопкой «Начать новую сессию» и обновлением страницы
+        (перейти на новый cookie sid, освободив прежний слот).
+
+        old_sid — текущий sid клиента: если задан, СЛОТ ОСВОБОЖДАЕТСЯ (сессия
+        удаляется, чтобы обновление страницы не плодило «мёртвые» слоты).
+        privileged — запрос от ВЛАДЕЛЬЦА: если мест нет, вытесняется самая
+        старая ОБЫЧНАЯ сессия, чтобы владельцу всегда нашёлся слот.
 
         Возвращает (kind, sid): "new" — выдан новый sid; "full" — мест нет.
-        Старый sid удаляется из памяти «offline» (клиент переходит на новый
-        cookie).
         """
         with self._lock:
+            # ОСВОБОЖДАЕМ старый слот клиента (обновление страницы / смена sid).
             if old_sid:
                 self._offline_seen.pop(old_sid, None)
                 self._sessions.pop(old_sid, None)
             if self._active_count_locked() >= self.max_sessions:
-                if old_sid:
-                    self._offline_seen[old_sid] = time.time()
-                return ("full", None)
+                # Владельцу всегда находим место (вытесняем обычную сессию).
+                if privileged and self._evict_one_locked(time.time()):
+                    pass
+                else:
+                    if old_sid:
+                        self._offline_seen[old_sid] = time.time()
+                    return ("full", None)
             sid = self._gen_sid_locked()
-            self._new_session_locked(sid)
+            self._new_session_locked(sid, privileged=privileged)
             return ("new", sid)
 
     def release(self, sid):
