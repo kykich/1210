@@ -121,8 +121,10 @@ function confirmHere() {
 }
 
 // Запрос новой сессии (кнопка «Начать новую сессию»).
+// Сервер: POST /api/newchat {renew:true} — выдаёт НОВЫЙ cookie sid,
+// ОСВОБОЖДАЯ прежний слот. Владельцу слот находится приоритетно.
 function startNewSession() {
-    apiPost("/api/newslot", {})
+    apiPost("/api/newchat", { renew: true })
         .then(function (d) {
             if (d && d.ok) {
                 // Сервер выдал новый sid; перезагружаем страницу, чтобы
@@ -135,6 +137,23 @@ function startNewSession() {
             setText("Свободных сессий сейчас нет. Попробуйте ещё раз через " +
                     "минуту.");
         });
+}
+
+// При ОБНОВЛЕНИИ страницы освобождаем прежний слот: просим сервер выдать
+// новый sid взамен старого (старый слот при этом освобождается). Делаем это
+// ОДИН раз за загрузку страницы. Если ротация не удалась (мест нет) —
+// работаем с текущей сессией.
+function rotateOnLoad() {
+    if (window.__sgRotated) return;
+    window.__sgRotated = true;
+    apiPost("/api/newchat", { renew: true })
+        .then(function (d) {
+            if (d && d.ok && d.renewed) {
+                // Новый sid уже в cookie; ничего перезагружать не нужно —
+                // последующие запросы пойдут по новой сессии.
+            }
+        })
+        .catch(function () { /* не мешаем работе: остаёмся на текущем sid */ });
 }
 
 // Реакция на HTTP-ошибки сессии из других запросов (перехват fetch).
@@ -191,6 +210,9 @@ export function initSessionGuard() {
     var nw = overlay && overlay.querySelector && overlay.querySelector(".sg-new");
     if (yes) yes.addEventListener("click", confirmHere);
     if (nw) nw.addEventListener("click", startNewSession);
+
+    // ОБНОВЛЕНИЕ СТРАНИЦЫ освобождает прежний слот (ротация sid).
+    rotateOnLoad();
 
     // Первый опрос чуть позже загрузки, затем — периодически.
     timer = setInterval(poll, HEARTBEAT_MS);
