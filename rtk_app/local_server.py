@@ -335,6 +335,46 @@ def server_url(host, port):
 
 
 # ---------------------------------------------------------------------------
+# УДАЛЁННЫЙ ДВИЖОК (локальная LLM с ПК оператора через SSH-туннель)
+# ---------------------------------------------------------------------------
+# На ПК (Windows) работает llama-server (сильная модель). ПК держит ПОСТОЯННЫЙ
+# reverse-туннель к VPS:  ssh -N -R 127.0.0.1:18080:127.0.0.1:8080 rtk@<VPS>.
+# Тогда движок ПК доступен на VPS как 127.0.0.1:18080. Эти функции НЕ
+# запускают подпроцесс (движок физически на ПК) — они лишь проверяют живость
+# туннеля и получают список моделей удалённого движка.
+def tunnel_url():
+    """Базовый URL OpenAI-совместимого API удалённого движка (через туннель)."""
+    return server_url(config.TUNNEL_HOST, config.TUNNEL_PORT)
+
+
+def probe_remote(url=None, timeout=None):
+    """Проверяет живость удалённого движка (GET /v1/models с Bearer).
+
+    url — базовый URL (…/v1); по умолчанию — адрес туннеля
+    (config.TUNNEL_HOST:config.TUNNEL_PORT). Возвращает dict:
+        {alive, models, error} — alive=True, если сервер ответил 200;
+        models — список id моделей удалённого движка (или []).
+    Используется для определения «ПК доступен» и для авто-возврата.
+    """
+    base = (str(url).strip() if url else tunnel_url())
+    key = str(getattr(config, "LOCAL_API_KEY", "") or "").strip()
+    try:
+        req = urllib.request.Request(base.rstrip("/") + "/models", method="GET")
+        if key:
+            req.add_header("Authorization", "Bearer " + key)
+        with urllib.request.urlopen(
+                req, timeout=timeout
+                or getattr(config, "TUNNEL_PROBE_TIMEOUT", 4)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        items = data.get("data") or []
+        models = [str(it.get("id")) for it in items
+                  if isinstance(it, dict) and it.get("id")]
+        return {"alive": True, "models": models, "error": None}
+    except Exception as exc:                       # noqa: BLE001
+        return {"alive": False, "models": [], "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # Менеджер процесса
 # ---------------------------------------------------------------------------
 class LocalServerManager:

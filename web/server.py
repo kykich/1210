@@ -111,7 +111,17 @@ JSON-API:
                               "status" — проверить живость и список моделей;
                               "models" — список моделей запущенного сервера;
                               "set"    — сохранить {enabled?, root?,
-                                         server_path?, params?}.
+                                         server_path?, params?};
+                              "pc_scan"     — ПРОСКАНИРОВАТЬ папку НА ПК
+                                         {root} через служебный API
+                                         ПК-агента (результат в pc_models);
+                              "tunnel_up"   — включить СИЛЬНУЮ модель
+                                         (ПК): проверить туннель 18080 и
+                                         переключить источник агента;
+                              "tunnel_down" — вернуть СЛАБУЮ модель
+                                         (VPS), остановить туннель;
+                              "confirm_status" — подтвердил ли оператор
+                                         на ПК подключение VPS.
     """
 import json
 import mimetypes
@@ -170,6 +180,17 @@ class _ServerState:
     # Последний статус запущенного сервера (runtime).
     local_runtime = None
     local_lock = threading.Lock()
+
+    # --- ЛОКАЛЬНАЯ LLM С ПК (SSH-туннель, Задача 1) ---
+    # Активный движок: "weak" (слабая Qwen-2B на VPS, 127.0.0.1:8080)
+    # либо "strong" (сильная Qwen-9B на ПК, видна как 127.0.0.1:18080).
+    local_engine = "weak"
+    # Последний результат сканирования папки НА ПК (служебный API агента).
+    pc_scan = None
+    # Поток фонового контроля туннеля (авто-возврат слабая <-> сильная).
+    tunnel_thread = None
+    tunnel_stop = None
+    tunnel_lock = threading.Lock()
 
     # VPS: реестр КЛИЕНТСКИХ сессий (лимит активных + автомат состояний).
     _RTK_VPS_SESSIONS = session_mgr.get_manager()
@@ -256,6 +277,16 @@ def _local_status_payload():
         "models": scan.get("models", []) or [],
         "servers": scan.get("servers", []) or [],
         "managers": scan.get("managers", []) or [],
+        # Модели, найденные НА ПК (удалённый скан через агент).
+        "pc_models": (_ServerState.pc_scan or {}).get("models", [])
+                     or [],
+        "pc_scan": _ServerState.pc_scan or {},
+        # Состояние туннеля к ПК + активный движок (слабая/сильная).
+        "tunnel": _tunnel_payload(),
+        "engine": _ServerState.local_engine,
+        "active_label": _active_label(),
+        "weak_label": config.WEAK_LABEL,
+        "strong_label": config.STRONG_LABEL,
         "running": running,
         "runtime": runtime,
     }
@@ -292,6 +323,171 @@ def _sync_agent_local():
                           if model_path else config.LOCAL_LABEL)
     agent.set_local_model(url=url, model=model_name,
                           label=config.LOCAL_LABEL)
+
+# ---------------------------------------------------------------------------
+# ЛОКАЛЬНАЯ LLM С ПК ЧЕРЕЗ SSH-ТУННЕЛЬ (Задача 1)
+# ---------------------------------------------------------------------------
+def _active_label():
+    """Имя АКТИВНОЙ модели для UI: слабая Qwen-2B или сильная Qwen-9B."""
+    return (config.STRONG_LABEL if _ServerState.local_engine == "strong"
+            else config.WEAK_LABEL)
+
+
+def _agent_api(path, payload=None, method="GET", timeout=None):
+    """Обращается к служебному API ПК-АГЕНТА (loopback VPS: config.AGENT_PORT).
+
+    ПК-агент пробрасывает служебный порт тем же SSH-каналом
+    (ssh -R 127.0.0.1:18081:127.0.0.1:18081). Через него rtk-web запрашивает
+    скан папки на ПК и статус подтверждения. Возвращает dict ответа агента
+    или {"ok": False, "error": ...} при недоступности (агент/туннель не поднят).
+    """
+    import urllib.request
+    import urllib.error
+    url = "http://%s:%d%s" % (config.AGENT_HOST, config.AGENT_PORT, path)
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(
+                req, timeout=timeout
+                or getattr(config, "AGENT_TIMEOUT", 15)) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        return {"ok": False, "alive": False,
+                "error": "агент ПК недоступен: %s" % exc}
+    except Exception as exc:                       # noqa: BLE001
+        return {"ok": False, "alive": False, "error": str(exc)}
+
+
+def _tunnel_probe(timeout=None):
+    """Проверяет живость туннеля к ПК (движок сильной модели)."""
+    return local_server.probe_remote(local_server.tunnel_url(),
+                                     timeout=timeout)
+
+
+def _tunnel_payload():
+    """Состояние туннеля к ПК + активный движок (для UI)."""
+    probe = _tunnel_probe()
+    conf = _agent_api("/confirm_status")
+    agent_alive = bool(conf.get("ok") or conf.get("alive"))
+    confirmed = bool(conf.get("confirmed")) if agent_alive else False
+    eng = _ServerState.local_engine
+    return {
+        "pc_alive": bool(probe.get("alive")),
+        "pc_models": probe.get("models") or [],
+        "pc_error": probe.get("error"),
+        "confirmed": confirmed,
+        "agent_alive": agent_alive,
+        "engine": eng,
+        "active_label": _active_label(),
+        "weak_label": config.WEAK_LABEL,
+        "strong_label": config.STRONG_LABEL,
+        "tunnel_host": config.TUNNEL_HOST,
+        "tunnel_port": config.TUNNEL_PORT,
+        "agent_port": config.AGENT_PORT,
+    }
+
+
+def _activate_strong():
+    """Включает СИЛЬНУЮ модель (ПК): источник агента local -> адрес туннеля."""
+    probe = _tunnel_probe()
+    if not probe.get("alive"):
+        return {"ok": False,
+                "error": "туннель к ПК недоступен: %s"
+                         % (probe.get("error") or "нет ответа"),
+                "engine": _ServerState.local_engine}
+    models = probe.get("models") or []
+    model_name = models[0] if models else config.STRONG_LABEL
+    url = local_server.tunnel_url()
+    agent = _ServerState.agent
+    if agent is not None and hasattr(agent, "set_local_model"):
+        agent.set_local_model(url=url, model=model_name,
+                              label=config.STRONG_LABEL)
+    _ServerState.local_engine = "strong"
+    print("[TUNNEL] активна СИЛЬНАЯ модель: %s (%s, model=%r)"
+          % (config.STRONG_LABEL, url, model_name), flush=True)
+    return {"ok": True, "engine": "strong", "url": url,
+            "model": model_name, "label": config.STRONG_LABEL}
+
+
+def _activate_weak():
+    """Возвращает СЛАБУЮ модель (VPS): источник local -> 127.0.0.1:8080."""
+    _ServerState.local_engine = "weak"
+    agent = _ServerState.agent
+    if agent is None or not hasattr(agent, "set_local_model"):
+        return {"ok": True, "engine": "weak", "label": config.WEAK_LABEL}
+    settings = _local_manager().load_settings()
+    params = settings.get("params") or {}
+    h = params.get("host") or config.LOCAL_HOST
+    p = params.get("port") or config.LOCAL_PORT
+    url = local_server.server_url(h, p)
+    runtime = _local_manager().status()
+    rmodels = runtime.get("models") or []
+    if rmodels:
+        model_name = rmodels[0]
+    else:
+        model_path = params.get("model") or ""
+        model_name = (os.path.splitext(os.path.basename(model_path))[0]
+                      if model_path else config.WEAK_LABEL)
+    agent.set_local_model(url=url, model=model_name, label=config.WEAK_LABEL)
+    print("[TUNNEL] активна СЛАБАЯ модель: %s (%s, model=%r)"
+          % (config.WEAK_LABEL, url, model_name), flush=True)
+    return {"ok": True, "engine": "weak", "url": url,
+            "model": model_name, "label": config.WEAK_LABEL}
+
+
+def _tunnel_tick_loop(interval, stop_event):
+    """Фоновый контроль туннеля: авто-возврат слабая <-> сильная."""
+    print("[TUNNEL] фоновый контроль туннеля: каждые %d c." % interval,
+          flush=True)
+    while not stop_event.is_set():
+        if stop_event.wait(interval):
+            break
+        try:
+            with _ServerState.tunnel_lock:
+                probe = _tunnel_probe()
+                alive = bool(probe.get("alive"))
+                eng = _ServerState.local_engine
+                if not alive and eng == "strong":
+                    print("[TUNNEL] обрыв туннеля — авто-возврат на слабую "
+                          "(%s)" % config.WEAK_LABEL, flush=True)
+                    _activate_weak()
+                elif alive and eng == "weak":
+                    print("[TUNNEL] туннель восстановлен — авто-возврат на "
+                          "сильную (%s)" % config.STRONG_LABEL, flush=True)
+                    _activate_strong()
+        except Exception as exc:                   # noqa: BLE001
+            print("[TUNNEL] ошибка контроля: %s" % exc, flush=True)
+    print("[TUNNEL] фоновый контроль туннеля остановлен.", flush=True)
+
+
+def _start_tunnel_tick():
+    """Запускает фоновый поток контроля туннеля (если не запущен)."""
+    interval = int(getattr(config, "TUNNEL_CHECK_PERIOD", 0) or 0)
+    if interval <= 0:
+        return
+    if (_ServerState.tunnel_thread
+            and _ServerState.tunnel_thread.is_alive()):
+        return
+    stop = threading.Event()
+    _ServerState.tunnel_stop = stop
+    th = threading.Thread(target=_tunnel_tick_loop, args=(interval, stop),
+                          daemon=True)
+    _ServerState.tunnel_thread = th
+    th.start()
+
+
+def _stop_tunnel_tick():
+    """Останавливает фоновый поток контроля туннеля."""
+    stop = _ServerState.tunnel_stop
+    if stop is not None:
+        stop.set()
+    _ServerState.tunnel_thread = None
+    _ServerState.tunnel_stop = None
+
 
 def _mcp_state_payload(check=False):
     """Собирает состояние MCP для ответа клиенту.
@@ -2208,6 +2404,43 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 _sync_agent_local()
                 return self._send_json(200, _local_status_payload())
 
+            if action == "pc_scan":
+                # СКАН ПАПКИ НА ПК: VPS напрямую папку ПК не видит, поэтому
+                # просим ПК-агента просканировать путь и вернуть список.
+                root = str(data.get("root") or "").strip()
+                res = _agent_api("/scan", {"root": root}, method="POST")
+                if res.get("ok") or res.get("models") is not None:
+                    _ServerState.pc_scan = {
+                        "models": res.get("models") or [],
+                        "servers": res.get("servers") or [],
+                        "root": root,
+                    }
+                payload = _local_status_payload()
+                payload["pc_result"] = res
+                return self._send_json(200, payload)
+
+            if action == "tunnel_up":
+                # ВКЛЮЧИТЬ СИЛЬНУЮ модель (ПК): поднять/включить туннель.
+                up = _activate_strong()
+                if up.get("ok"):
+                    _start_tunnel_tick()
+                payload = _local_status_payload()
+                payload["tunnel_result"] = up
+                return self._send_json(200, payload)
+
+            if action == "tunnel_down":
+                # ВЕРНУТЬ СЛАБУЮ модель (VPS): остановить туннель.
+                _stop_tunnel_tick()
+                down = _activate_weak()
+                payload = _local_status_payload()
+                payload["tunnel_result"] = down
+                return self._send_json(200, payload)
+
+            if action == "confirm_status":
+                res = _agent_api("/confirm_status")
+                return self._send_json(200, {"ok": True, "confirm": res,
+                                             "tunnel": _tunnel_payload()})
+
             # action == "state" и всё прочее.
             return self._send_json(200, _local_status_payload())
 
@@ -2335,6 +2568,19 @@ def serve(agent_or_key, host=None, port=None, open_page=True, agent=None):
         _sm.start_gc_thread()
     except Exception as _exc:
         print("[SESSION] gc-поток не запущен: %s" % _exc, flush=True)
+
+    # ЛОКАЛЬНАЯ LLM С ПК: если туннель к ПК уже поднят (агент ПК работает),
+    # сразу активируем СИЛЬНУЮ модель; иначе — слабую (Qwen-2B). Фоновый
+    # контроль туннеля обеспечивает двусторонний авто-возврат.
+    try:
+        if _tunnel_probe().get("alive"):
+            _activate_strong()
+        else:
+            _activate_weak()
+        _start_tunnel_tick()
+    except Exception as _exc:
+        print("[TUNNEL] авто-инициализация не удалась: %s" % _exc,
+              flush=True)
 
     httpd = create_server(agent, host, port)
     shown_host, shown_port = httpd.server_address[:2]
