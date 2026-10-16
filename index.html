@@ -279,12 +279,34 @@
                             <span>корень папки</span>
                             <input type="text" id="local-root" class="gen-input local-input"
                                    placeholder="путь к папке с llama-server и моделями" maxlength="400">
-                        </label>
+                                                </label>
                         <div class="local-status-row">
                             <button id="local-scan" type="button" class="btn-side">Сканировать</button>
                             <button id="local-start" type="button" class="btn-side primary">Запустить</button>
                             <button id="local-stop" type="button" class="btn-side link">Остановить</button>
                             <button id="local-status-btn" type="button" class="btn-side link">Статус</button>
+                        </div>
+                        <!-- ЗАДАЧА 1: сильная модель с ПК оператора через
+                             SSH-туннель. VPS переключает источник агента
+                             "local" между СЛАБОЙ (Qwen-2B на VPS) и СИЛЬНОЙ
+                             (Qwen-9B на ПК, 127.0.0.1:18080) моделью. -->
+                        <div class="local-engine" id="local-engine-box">
+                            <div class="local-engine-head">Модель для ответов</div>
+                            <div class="local-engine-toggle" id="local-engine-group">
+                                <button type="button" class="engine-btn active"
+                                        data-engine="weak"
+                                        title="Слабая модель на VPS (Qwen-2B)">Слабая (VPS)</button>
+                                <button type="button" class="engine-btn"
+                                        data-engine="strong"
+                                        title="Сильная модель на ПК оператора через SSH-туннель (Qwen-9B)">Сильная (ПК)</button>
+                            </div>
+                            <div class="local-status-row">
+                                <button id="local-pc-scan" type="button" class="btn-side"
+                                        title="Просканировать папку НА ПК через ПК-агент">Сканировать папку ПК</button>
+                                <button id="local-pc-tunnel" type="button" class="btn-side"
+                                        title="Проверить туннель к ПК и включить сильную модель">Проверить ПК</button>
+                            </div>
+                            <span id="local-engine-status" class="local-status">активна: слабая (VPS)</span>
                         </div>
                         <label class="compact-label side-label">
                             <span>сервер</span>

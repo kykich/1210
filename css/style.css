@@ -1637,6 +1637,41 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
 .local-status.warn { color: #e0c07a; }
 .local-status.error { color: #f08a86; }
 
+/* ЗАДАЧА 1: переключатель движка «слабая (VPS) / сильная (ПК)». */
+.local-engine {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+    padding-top: 6px;
+    border-top: 1px dashed #2a3350;
+}
+.local-engine-head {
+    font-size: .68rem;
+    color: #9fb4e6;
+}
+.local-engine-toggle {
+    display: flex;
+    gap: 6px;
+}
+.local-engine-toggle .engine-btn {
+    flex: 1 1 0;
+    padding: 5px 6px;
+    font-size: .7rem;
+    border: 1px solid #35406a;
+    border-radius: 6px;
+    background: #1a2033;
+    color: #b9c4dc;
+    cursor: pointer;
+}
+.local-engine-toggle .engine-btn:hover { border-color: #4d5c92; }
+.local-engine-toggle .engine-btn.active {
+    background: #2b6cb0;
+    border-color: #3b82f6;
+    color: #fff;
+    font-weight: 600;
+}
+
 /* ===== Доска (task5): таблица «событие ↔ курс валюты» ===== */
 .msg.a .board-table {
     width: 100%;

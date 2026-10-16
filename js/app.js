@@ -2439,6 +2439,13 @@ import { initSessionGuard } from "./features/sessionGuard.js";
         localState.running = !!d.running;
         localState.runtime = d.runtime || null;
         if (d.params) localState.params = d.params;
+        // Состояние туннеля к ПК + активный движок (Задача 1).
+        if (d.tunnel) localState.tunnel = d.tunnel;
+        if (d.engine) localState.engine = d.engine;
+        if (d.active_label) localState.active_label = d.active_label;
+        if (d.weak_label) localState.weak_label = d.weak_label;
+        if (d.strong_label) localState.strong_label = d.strong_label;
+        if (d.pc_models) localState.pc_models = d.pc_models;
 
         if (localEnabledEl) localEnabledEl.checked = localState.enabled;
         if (localRootEl && document.activeElement !== localRootEl) {
@@ -2487,6 +2494,7 @@ import { initSessionGuard } from "./features/sessionGuard.js";
             if (localFlashEl && s.flash_attn) localFlashEl.value = s.flash_attn;
         }
         renderLocalStatus();
+        renderLocalEngine();
         refreshSections();
     }
 
@@ -2603,6 +2611,107 @@ import { initSessionGuard } from "./features/sessionGuard.js";
     // .side вынесены в ОТДЕЛЬНЫЙ модуль features/sections.js (рефакторинг
     // на ES-модули). Здесь лишь ПОДКЛЮЧАЕМ его и передаём функцию-геттер
     // состояния «использования» секций (dependency injection).
+    // Поток данных папки НА ПК (результат последнего pc_scan) + движок.
+    var localPcScanEl = document.getElementById("local-pc-scan");
+    var localPcTunnelEl = document.getElementById("local-pc-tunnel");
+    var localEngineGroup = document.getElementById("local-engine-group");
+    var localEngineStatusEl = document.getElementById("local-engine-status");
+
+    // Отрисовывает состояние движка (слабая/сильная) по данным со /api/local:
+    // имя АКТИВНОЙ модели + доступность туннеля к ПК (без списка моделей).
+    function renderLocalEngine() {
+        if (!localEngineStatusEl) return;
+        var d = localState.tunnel || {};
+        var eng = d.engine || localState.engine || "weak";
+        var label = d.active_label || (eng === "strong"
+            ? (localState.strong_label || "Qwen-9B")
+            : (localState.weak_label || "Qwen-2B"));
+        var parts = ["активна: " + label];
+        if (d.pc_alive) {
+            parts.push("ПК доступен" + (d.pc_models && d.pc_models.length
+                ? " (" + d.pc_models.length + " мод.)" : ""));
+        } else {
+            parts.push("ПК недоступен");
+        }
+        if (d.confirmed) parts.push("подтверждено");
+        localEngineStatusEl.textContent = parts.join(" · ");
+        localEngineStatusEl.className = "local-status " +
+            (eng === "strong" ? "ok" : "");
+        if (localEngineGroup) {
+            var btns = localEngineGroup.querySelectorAll(".engine-btn");
+            for (var i = 0; i < btns.length; i++) {
+                btns[i].classList.toggle("active",
+                    btns[i].dataset.engine === eng);
+            }
+        }
+    }
+
+    // Переключение движка: слабая (VPS) <-> сильная (ПК через туннель).
+    if (localEngineGroup) {
+        localEngineGroup.addEventListener("click", function (e) {
+            var btn = e.target.closest(".engine-btn");
+            if (!btn) return;
+            var want = btn.dataset.engine;
+            var cur = (localState.tunnel || {}).engine || localState.engine ||
+                "weak";
+            if (want === cur) return;
+            var action = want === "strong" ? "tunnel_up" : "tunnel_down";
+            setStatus(want === "strong"
+                ? "Включаю сильную модель (ПК)…"
+                : "Возвращаю слабую модель (VPS)…", "");
+            localAction(action, null, function (d) {
+                var res = (d && d.tunnel_result) || {};
+                if (res.ok === false) {
+                    setStatus("Не удалось переключить модель: " +
+                        (res.error || "?"), "error");
+                } else {
+                    setStatus(want === "strong"
+                        ? "Активна сильная модель (ПК)."
+                        : "Активна слабая модель (VPS).", "ok");
+                }
+            });
+        });
+    }
+
+    // Сканирование папки НА ПК (VPS просит ПК-агент через служебный API).
+    if (localPcScanEl) {
+        localPcScanEl.addEventListener("click", function () {
+            var root = localRootEl ? localRootEl.value.trim() : "";
+            localPcScanEl.disabled = true;
+            setStatus("Сканирую папку НА ПК…", "");
+            localAction("pc_scan", { root: root }, function (d) {
+                localPcScanEl.disabled = false;
+                var res = (d && d.pc_result) || {};
+                if (res.ok === false || res.error) {
+                    setStatus("ПК-агент недоступен: " +
+                        (res.error || "нет туннеля"), "error");
+                } else {
+                    setStatus("На ПК найдено моделей: " +
+                        ((res.models || []).length) + ", серверов: " +
+                        ((res.servers || []).length), "ok");
+                }
+            });
+        });
+    }
+
+    // Проверка/подъём туннеля к ПК (включить сильную модель).
+    if (localPcTunnelEl) {
+        localPcTunnelEl.addEventListener("click", function () {
+            localPcTunnelEl.disabled = true;
+            setStatus("Проверяю туннель к ПК…", "");
+            localAction("tunnel_up", null, function (d) {
+                localPcTunnelEl.disabled = false;
+                var res = (d && d.tunnel_result) || {};
+                if (res.ok === false) {
+                    setStatus("Туннель к ПК недоступен: " +
+                        (res.error || "?"), "error");
+                } else {
+                    setStatus("Туннель к ПК активен — сильная модель.", "ok");
+                }
+            });
+        });
+    }
+
     sectionsRefresh = initSections(function () {
         return {
             strategy: !!(strategyState && strategyState.strategy &&
