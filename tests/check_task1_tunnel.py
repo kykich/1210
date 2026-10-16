@@ -195,6 +195,65 @@ def main():
     finally:
         config.AGENT_PORT = real_port
 
+    # ------------------------------------------------------------------
+    section('5. "Вариант А": команда запуска ПК-агента (_pair_payload)')
+    pair = srv._pair_payload()
+    check("_pair_payload возвращает dict", isinstance(pair, dict),
+          "%r" % pair)
+    for key in ("vps", "engine_port", "tunnel_port", "agent_port",
+                "identity", "command", "script"):
+        check("_pair_payload содержит ключ %r" % key, key in pair,
+              "%r" % list(pair.keys()))
+    check("engine_port совпадает с config.LOCAL_PORT",
+          pair["engine_port"] == config.LOCAL_PORT, "%r" % pair["engine_port"])
+    check("tunnel_port совпадает с config.TUNNEL_PORT",
+          pair["tunnel_port"] == config.TUNNEL_PORT, "%r" % pair["tunnel_port"])
+    check("agent_port совпадает с config.AGENT_PORT",
+          pair["agent_port"] == config.AGENT_PORT, "%r" % pair["agent_port"])
+    check("identity указывает на ключ rtk_pc",
+          "rtk_pc" in pair["identity"], "%r" % pair["identity"])
+
+    # command — однострочная PowerShell-команда, script — многострочный .ps1.
+    check("command — модуль rtk_pc_agent",
+          "rtk_pc_agent" in pair["command"], "%r" % pair["command"])
+    check("command содержит порт движка",
+          str(config.LOCAL_PORT) in pair["command"], "%r" % pair["command"])
+    check("command содержит порт туннеля",
+          str(config.TUNNEL_PORT) in pair["command"], "%r" % pair["command"])
+    check("command содержит порт агента",
+          str(config.AGENT_PORT) in pair["command"], "%r" % pair["command"])
+    check("command — одна строка (без переносов)",
+          "\n" not in pair["command"] and "\r" not in pair["command"],
+          "%r" % pair["command"])
+    check("script — многострочный (есть переносы)",
+          "\n" in pair["script"] or "\r" in pair["script"])
+    check("script содержит тот же модуль",
+          "rtk_pc_agent" in pair["script"], "%r" % pair["script"])
+
+    # Пустой TUNNEL_SSH -> плейсхолдер вместо реального адреса.
+    real_ssh = config.TUNNEL_SSH
+    try:
+        config.TUNNEL_SSH = ""
+        p_empty = srv._pair_payload()
+        check("при пустом TUNNEL_SSH поле vps пусто",
+              p_empty["vps"] == "", "%r" % p_empty["vps"])
+        check("при пустом TUNNEL_SSH есть плейсхолдер <IP-этого-VPS>",
+              "IP-этого-VPS" in p_empty["command"],
+              "%r" % p_empty["command"])
+
+        config.TUNNEL_SSH = "rtk@10.0.0.5"
+        p_full = srv._pair_payload()
+        check("при заданном TUNNEL_SSH поле vps заполнено",
+              p_full["vps"] == "rtk@10.0.0.5", "%r" % p_full["vps"])
+        check("при заданном TUNNEL_SSH адрес подставлен в command",
+              "rtk@10.0.0.5" in p_full["command"],
+              "%r" % p_full["command"])
+        check("при заданном TUNNEL_SSH плейсхолдера нет",
+              "IP-этого-VPS" not in p_full["command"],
+              "%r" % p_full["command"])
+    finally:
+        config.TUNNEL_SSH = real_ssh
+
     # Убираем временную папку.
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)

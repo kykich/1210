@@ -414,13 +414,50 @@ ssh -N -R 127.0.0.1:18080:127.0.0.1:8080 rtk@<VPS>
 | **ПК-агент** | `rtk_pc_agent/agent.py`, `__main__.py` | скан папки ПК (`_scan_folder`), окно-подтверждение (Windows `ctypes` MessageBox + консольный фолбэк, один раз на SSH-сессию), reverse-туннель с двумя `-R` (движок + служебный API), авто-перезапуск, служебный loopback-HTTP (`/health`, `/scan`, `/confirm`, `/confirm_status`). Запуск: `python -m rtk_pc_agent --vps … --root …` |
 | **Конфиг** | `rtk_app/config.py` | `TUNNEL_HOST/PORT` (`127.0.0.1:18080`), `AGENT_HOST/PORT` (`127.0.0.1:18081`), `WEAK_LABEL=Qwen-2B`, `STRONG_LABEL=Qwen-9B`, `CONFIRM_TIMEOUT=120`, `TUNNEL_CHECK_PERIOD=20`, `AGENT_TIMEOUT`, `TUNNEL_PROBE_TIMEOUT` |
 | **Движок (удалённый)** | `rtk_app/local_server.py` | `tunnel_url()`, `probe_remote()` — проверка живости удалённого движка ПК через туннель (`GET /v1/models` с `Bearer`) без запуска подпроцесса |
-| **ВПС-логика** | `web/server.py` | `_active_label()`, `_agent_api()` (обращение к служебному API ПК-агента), `_tunnel_probe()`, `_tunnel_payload()`, `_activate_strong()`, `_activate_weak()`, фоновый `_tunnel_tick_loop` (двусторонний авто-возврат), ветки `_handle_local`: `pc_scan` / `tunnel_up` / `tunnel_down` / `confirm_status`; авто-инициализация в `serve()` |
-| **UI** | `index.html`, `js/app.js`, `css/style.css` | переключатель «Слабая (VPS) / Сильная (ПК)», кнопки «Сканировать папку ПК» и «Проверить ПК», имя АКТИВНОЙ модели + статус туннеля; `renderLocalEngine()` |
+| **ВПС-логика** | `web/server.py` | `_active_label()`, `_agent_api()` (обращение к служебному API ПК-агента), `_tunnel_probe()`, `_tunnel_payload()`, `_activate_strong()`, `_activate_weak()`, `_pair_payload()` (готовая команда запуска ПК-агента, «Вариант А»), фоновый `_tunnel_tick_loop` (двусторонний авто-возврат), ветки `_handle_local`: `pc_scan` / `pair` / `tunnel_up` / `tunnel_down` / `confirm_status`; авто-инициализация в `serve()` |
+| **UI** | `index.html`, `js/app.js`, `css/style.css` | переключатель «Слабая (VPS) / Сильная (ПК)», кнопки «Сканировать папку ПК» и «Проверить ПК», имя АКТИВНОЙ модели + статус туннеля; `renderLocalEngine()`; кнопка **«Поднять сильную модель (ПК)»** и панель «Вариант А» (см. §13) |
 | **Деплой ПК** | `deploy/pc-agent/README.md`, `run_pc_agent.ps1` | инструкция: ключ с `permitlisten`, запуск агента, автозагрузка (Планировщик), проверка на VPS |
-| **Тесты** | `tests/check_task1_tunnel.py` | 31 проверка: скан папки, служебный HTTP-API агента, сборка команды SSH-туннеля, ВПС-сторона (статус движка, деградация без туннеля) |
+| **Тесты** | `tests/check_task1_tunnel.py` | 55 проверок: скан папки, служебный HTTP-API агента, сборка команды SSH-туннеля, ВПС-сторона (статус движка, деградация без туннеля), «Вариант А» (`_pair_payload`: ключи, порты, `command`/`script`, подстановка `TUNNEL_SSH` и плейсхолдер) |
 
 Поток: ПК-агент держит reverse-туннель → VPS по кнопке «Сильная (ПК)»
 проверяет `127.0.0.1:18080`, переключает источник агента `local` на туннель
 (`Qwen-9B`) и запускает фоновый контроль; при обрыве — авто-возврат на
 `Qwen-2B`, при восстановлении — авто-возврат на `Qwen-9B`.
+
+---
+
+## 13. «Вариант А»: подключение ПК для неспециалиста
+
+**Проблема.** Reverse-SSH-туннель физически поднимает ПК-агент **на ПК**,
+поэтому VPS не может запустить его сам (это архитектурная правда, а не
+ограничение реализации). Кнопка «Сильная (ПК)» работает только когда
+туннель уже поднят вручную.
+
+**Решение.** Кнопка **«Поднять сильную модель (ПК)»** и панель-подсказка,
+которые ведут неспециалиста по шагам:
+
+1. Кнопка `#local-pc-pair` открывает панель `#local-pair-box`.
+2. VPS отдаёт **готовую команду** запуска ПК-агента с уже подставленными
+   параметрами этого VPS (порты движка/туннеля/агента, ключ
+   `%USERPROFILE%\.ssh\rtk_pc`, адрес VPS `TUNNEL_SSH`). Достаточно вставить
+   в PowerShell на ПК. Если `TUNNEL_SSH` пуст — в команде плейсхолдер
+   `rtk@<IP-этого-VPS>`.
+3. Панель **следит за появлением туннеля** (фоновый опрос `/api/local`
+   с `action:"pair"` каждые 4 с, пока панель открыта).
+4. При успехе (`tunnel.pc_alive`) предлагается/выполняется переключение
+   движка на сильную модель (`action:"tunnel_up"` → `_activate_strong`).
+
+**Компоненты.**
+
+| Слой | Что сделано |
+|---|---|
+| `web/server.py` | `_pair_payload()` — поля `vps`, `engine_port`, `tunnel_port`, `agent_port`, `identity`, `command` (однострочная PowerShell), `script` (многострочный `.ps1`). Ветка `action == "pair"` в `_handle_local` отдаёт `pair` + текущий `tunnel` |
+| `index.html` | кнопка `#local-pc-pair`, панель `#local-pair-box` (подсказка, поле `#local-pair-cmd`, кнопки `#local-pair-copy`, `#local-pair-check`, `#local-pair-hide`, статус `#local-pair-status`) |
+| `css/style.css` | стили `.local-pc-pair`, `.local-pair-box`, `.local-pair-hint`, `.local-pair-cmd` |
+| `js/app.js` | ссылки на элементы панели, `renderLocalPair(d)`, `startLocalPairPoll()` / `stopLocalPairPoll()` (опрос каждые 4 с), обработчики кнопок (показать команду, копировать, «Проверить подключение», скрыть), проброс `d.pair` в `localState` |
+
+**Тесты.** `tests/check_task1_tunnel.py`, секция 5 («Вариант А»): проверяют
+набор ключей `_pair_payload`, соответствие портов `config`, формат
+`command`/`script`, подстановку `TUNNEL_SSH` и плейсхолдер при пустом
+значении. Полный прогон — 55 OK.
 
