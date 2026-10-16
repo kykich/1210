@@ -73,3 +73,6 @@ docs_rag/
 last_resp.json
 sess.json
 
+# --- однократные скрипты миграции/патча (не в историю) ---
+patch_server.py
+

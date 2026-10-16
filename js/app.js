@@ -2446,6 +2446,9 @@ import { initSessionGuard } from "./features/sessionGuard.js";
         if (d.weak_label) localState.weak_label = d.weak_label;
         if (d.strong_label) localState.strong_label = d.strong_label;
         if (d.pc_models) localState.pc_models = d.pc_models;
+        // Готовая команда запуска ПК-агента + статус (Задача 1, «Вариант А»).
+        if (d.pair) localState.pair = d.pair;
+        renderLocalPair(d);
 
         if (localEnabledEl) localEnabledEl.checked = localState.enabled;
         if (localRootEl && document.activeElement !== localRootEl) {
@@ -2617,6 +2620,54 @@ import { initSessionGuard } from "./features/sessionGuard.js";
     var localEngineGroup = document.getElementById("local-engine-group");
     var localEngineStatusEl = document.getElementById("local-engine-status");
 
+    // ЗАДАЧА 1, «Вариант А»: панель подключения ПК (для неспециалиста).
+    var localPcPairEl = document.getElementById("local-pc-pair");
+    var localPairBoxEl = document.getElementById("local-pair-box");
+    var localPairCmdEl = document.getElementById("local-pair-cmd");
+    var localPairCopyEl = document.getElementById("local-pair-copy");
+    var localPairCheckEl = document.getElementById("local-pair-check");
+    var localPairHideEl = document.getElementById("local-pair-hide");
+    var localPairStatusEl = document.getElementById("local-pair-status");
+    // Таймер фонового опроса статуса туннеля, пока открыта панель подключения.
+    var localPairPollTimer = null;
+
+    // Показывает/обновляет подсказку с командой запуска ПК-агента.
+    function renderLocalPair(d) {
+        var pair = (d && d.pair) || localState.pair;
+        if (pair) localState.pair = pair;
+        if (localPairCmdEl && pair && pair.command) {
+            localPairCmdEl.value = pair.command;
+        }
+        if (!localPairStatusEl) return;
+        var tn = (d && d.tunnel) || localState.tunnel || {};
+        if (tn.pc_alive) {
+            localPairStatusEl.textContent =
+                "\u2705 \u041f\u041a \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0451\u043d \u2014 \u0441\u0438\u043b\u044c\u043d\u0430\u044f \u043c\u043e\u0434\u0435\u043b\u044c \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430.";
+            localPairStatusEl.className = "local-status ok";
+        } else {
+            localPairStatusEl.textContent =
+                "\u043e\u0436\u0438\u0434\u0430\u044e \u0437\u0430\u043f\u0443\u0441\u043a \u041f\u041a-\u0430\u0433\u0435\u043d\u0442\u0430 \u043d\u0430 \u041f\u041a\u2026";
+            localPairStatusEl.className = "local-status warn";
+        }
+    }
+
+    // Фоновый опрос /api/local (action=pair), пока панель открыта.
+    function startLocalPairPoll() {
+        stopLocalPairPoll();
+        localPairPollTimer = setInterval(function () {
+            localAction("pair", null, function (d) {
+                if (d) renderLocalPair(d);
+            });
+        }, 4000);
+    }
+
+    function stopLocalPairPoll() {
+        if (localPairPollTimer) {
+            clearInterval(localPairPollTimer);
+            localPairPollTimer = null;
+        }
+    }
+
     // Отрисовывает состояние движка (слабая/сильная) по данным со /api/local:
     // имя АКТИВНОЙ модели + доступность туннеля к ПК (без списка моделей).
     function renderLocalEngine() {
@@ -2689,6 +2740,75 @@ import { initSessionGuard } from "./features/sessionGuard.js";
                     setStatus("На ПК найдено моделей: " +
                         ((res.models || []).length) + ", серверов: " +
                         ((res.servers || []).length), "ok");
+                }
+            });
+        });
+    }
+
+    // ЗАДАЧА 1, «Вариант А»: кнопка «Поднять сильную модель (ПК)» для
+    // НЕСПЕЦИАЛИСТА. Раскрывает панель с готовой командой запуска ПК-агента
+    // (параметры VPS уже подставлены) и запускает фоновый опрос туннеля.
+    if (localPcPairEl) {
+        localPcPairEl.addEventListener("click", function () {
+            if (localPairBoxEl) localPairBoxEl.hidden = false;
+            setStatus("Готовлю команду для ПК\u2026", "");
+            localAction("pair", null, function (d) {
+                if (d) renderLocalPair(d);
+            });
+            startLocalPairPoll();
+        });
+    }
+    if (localPairHideEl) {
+        localPairHideEl.addEventListener("click", function () {
+            if (localPairBoxEl) localPairBoxEl.hidden = true;
+            stopLocalPairPoll();
+        });
+    }
+    if (localPairCopyEl) {
+        localPairCopyEl.addEventListener("click", function () {
+            var cmd = localPairCmdEl ? localPairCmdEl.value : "";
+            if (!cmd) return;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(cmd).then(function () {
+                    setStatus("Команда скопирована \u2014 вставьте её в "
+                        + "PowerShell на ПК.", "ok");
+                }).catch(function () {
+                    if (localPairCmdEl) localPairCmdEl.select();
+                    setStatus("Скопируйте команду вручную (Ctrl+C).", "warn");
+                });
+            } else if (localPairCmdEl) {
+                localPairCmdEl.select();
+                setStatus("Скопируйте команду вручную (Ctrl+C).", "warn");
+            }
+        });
+    }
+    if (localPairCheckEl) {
+        localPairCheckEl.addEventListener("click", function () {
+            localPairCheckEl.disabled = true;
+            setStatus("Проверяю подключение ПК\u2026", "");
+            localAction("pair", null, function (d) {
+                localPairCheckEl.disabled = false;
+                if (d) renderLocalPair(d);
+                var tn = (d && d.tunnel) || localState.tunnel || {};
+                if (tn.pc_alive) {
+                    // Туннель поднят — переключаем движок на сильную модель.
+                    localAction("tunnel_up", null, function (dd) {
+                        var res = (dd && dd.tunnel_result) || {};
+                        if (res.ok === false) {
+                            setStatus("Туннель есть, но включить сильную "
+                                + "модель не удалось: " + (res.error || "?"),
+                                "error");
+                        } else {
+                            setStatus("Готово: активна сильная модель (ПК).",
+                                "ok");
+                            stopLocalPairPoll();
+                            if (localPairBoxEl) localPairBoxEl.hidden = true;
+                        }
+                    });
+                } else {
+                    setStatus("ПК пока не подключился. Запустите команду "
+                        + "на ПК и нажмите «Проверить подключение» ещё раз.",
+                        "warn");
                 }
             });
         });

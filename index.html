@@ -300,9 +300,36 @@
                                         data-engine="strong"
                                         title="Сильная модель на ПК оператора через SSH-туннель (Qwen-9B)">Сильная (ПК)</button>
                             </div>
-                            <div class="local-status-row">
+                                                        <div class="local-status-row">
                                 <button id="local-pc-scan" type="button" class="btn-side"
                                         title="Просканировать папку НА ПК через ПК-агент">Сканировать папку ПК</button>
+                            </div>
+                            <!-- ЗАДАЧА 1, «ВАРИАНТ А»: кнопка для НЕСПЕЦИАЛИСТА.
+                                 Reverse-туннель поднимает ПК-агент НА ПК, поэтому
+                                 кнопка лишь раскрывает готовую команду запуска
+                                 агента (с подставленными параметрами VPS) и
+                                 следит за появлением туннеля. -->
+                            <button id="local-pc-pair" type="button" class="btn-side primary local-pc-pair"
+                                    title="Подключить сильную модель с ПК оператора: показать готовую команду и следить за туннелем">Поднять сильную модель (ПК)</button>
+                            <div id="local-pair-box" class="local-pair-box" hidden>
+                                <div class="local-pair-hint">
+                                    На ПК с сильной моделью откройте <b>PowerShell</b>,
+                                    вставьте эту команду и нажмите Enter.
+                                    На ПК появится окно подтверждения — нажмите «Да».
+                                </div>
+                                <textarea id="local-pair-cmd" class="local-pair-cmd"
+                                          rows="5" readonly></textarea>
+                                <div class="local-status-row">
+                                    <button id="local-pair-copy" type="button" class="btn-side"
+                                            title="Скопировать команду в буфер обмена">Скопировать</button>
+                                    <button id="local-pair-check" type="button" class="btn-side"
+                                            title="Проверить, поднялся ли туннель, и включить сильную модель">Проверить подключение</button>
+                                    <button id="local-pair-hide" type="button" class="btn-side link"
+                                            title="Свернуть подсказку">Скрыть</button>
+                                </div>
+                                <span id="local-pair-status" class="local-status">ожидаю запуск ПК-агента…</span>
+                            </div>
+                            <div class="local-status-row">
                                 <button id="local-pc-tunnel" type="button" class="btn-side"
                                         title="Проверить туннель к ПК и включить сильную модель">Проверить ПК</button>
                             </div>

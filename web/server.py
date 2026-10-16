@@ -391,6 +391,40 @@ def _tunnel_payload():
     }
 
 
+def _pair_payload():
+    """Готовые команды запуска ПК-агента (Задача 1, "Вариант А").
+
+    Кнопка "Поднять сильную модель (ПК)" - для НЕСПЕЦИАЛИСТА. Reverse-SSH-
+    туннель физически поднимает ПК-агент НА ПК, поэтому VPS не может сделать
+    это сам. Сервер отдаёт готовую команду запуска агента с УЖЕ
+    подставленными параметрами этого VPS - её достаточно вставить в
+    PowerShell на ПК. Возвращает поля: vps, engine_port, tunnel_port,
+    agent_port, identity, command, script.
+    """
+    vps = str(getattr(config, "TUNNEL_SSH", "") or "").strip()
+    engine_port = int(getattr(config, "LOCAL_PORT", 8080) or 8080)
+    tunnel_port = int(getattr(config, "TUNNEL_PORT", 18080) or 18080)
+    agent_port = int(getattr(config, "AGENT_PORT", 18081) or 18081)
+    identity = "%USERPROFILE%\\.ssh\\rtk_pc"
+    vps_arg = vps or "rtk@<IP-этого-VPS>"
+    command = (
+        "python -m rtk_pc_agent --vps %s --identity \"%s\" "
+        "--engine-port %d --tunnel-port %d --agent-port %d"
+        % (vps_arg, identity, engine_port, tunnel_port, agent_port))
+    script = (
+        "$ErrorActionPreference = \"Stop\"\r\n"
+        "python -m rtk_pc_agent `\r\n"
+        "  --vps %s `\r\n"
+        "  --identity \"%s\" `\r\n"
+        "  --engine-port %d `\r\n"
+        "  --tunnel-port %d `\r\n"
+        "  --agent-port %d\r\n"
+        % (vps_arg, identity, engine_port, tunnel_port, agent_port))
+    return {"vps": vps, "engine_port": engine_port, "tunnel_port": tunnel_port,
+            "agent_port": agent_port, "identity": identity,
+            "command": command, "script": script}
+
+
 def _activate_strong():
     """Включает СИЛЬНУЮ модель (ПК): источник агента local -> адрес туннеля."""
     probe = _tunnel_probe()
@@ -2417,6 +2451,17 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                     }
                 payload = _local_status_payload()
                 payload["pc_result"] = res
+                return self._send_json(200, payload)
+
+            if action == "pair":
+                # ПОДГОТОВКА ПОДКЛЮЧЕНИЯ К ПК (Задача 1, "Вариант А"):
+                # отдаём готовую команду запуска ПК-агента с подставленными
+                # параметрами VPS + текущий статус туннеля. Reverse-туннель
+                # поднимает ПК-агент НА ПК; эта ветка лишь помогает
+                # неспециалисту запустить его и следит за результатом.
+                payload = _local_status_payload()
+                payload["pair"] = _pair_payload()
+                payload["tunnel"] = _tunnel_payload()
                 return self._send_json(200, payload)
 
             if action == "tunnel_up":
