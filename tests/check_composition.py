@@ -246,8 +246,10 @@ def main():
             seen["answer"] += 1
             return {"ok": True, "text": "regular", "html": "", "answers": []}
 
-        def answer_via_mcp(self, question, tools, model=None, server_id=None):
-            seen["via_mcp"] = {"model": model, "server_id": server_id}
+        def answer_via_mcp(self, question, tools, model=None, server_id=None,
+                           tool_defaults=None):
+            seen["via_mcp"] = {"model": model, "server_id": server_id,
+                               "tool_defaults": tool_defaults}
             return {"ok": True, "text": "board table", "html": "", "answers": []}
 
     ws.mcp_client = _FakeSysClient
@@ -304,9 +306,11 @@ def main():
             seen2["answer"] += 1
             return {"ok": True, "text": "regular", "html": "", "answers": []}
 
-        def answer_via_mcp(self, question, tools, model=None, server_id=None):
+        def answer_via_mcp(self, question, tools, model=None, server_id=None,
+                           tool_defaults=None):
             seen2["via_mcp"] = True
             seen2["model"] = model
+            seen2["tool_defaults"] = tool_defaults
             return {"ok": True, "text": "mcp", "html": "", "answers": []}
 
         def compose_message(self, text, model=None, fallback=""):

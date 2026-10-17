@@ -193,26 +193,28 @@
             </section>
 
             <!-- RAG (Retrieval-Augmented Generation): ответы с ОПОРОЙ на
-                 локальную базу знаний из PDF-документов. Папка с PDF
-                 индексируется (текстовый слой → чанки → эмбеддинги через
-                 Ollama nomic-embed-text-v2-moe), а при запросе найденные
+                 локальную базу знаний из PDF, документации и КОДА проекта.
+                 Индексируются PDF (текстовый слой), README.md, папка docs/
+                 и исходники (.py/.js/.css и др.): текст → чанки → эмбеддинги
+                 через Ollama nomic-embed-text-v2-moe. При запросе найденные
                  фрагменты подмешиваются в промпт модели (режим A2). Путь к
-                 папке НАСТРАИВАЕМЫЙ, из PDF берётся только текст. -->
+                 папке НАСТРАИВАЕМЫЙ; из PDF берётся только текст, у
+                 текстовых файлов страниц нет (id вида README.md#chunk.3). -->
             <section class="side-sec" data-section="rag">
                 <button type="button" class="side-sec-head" aria-expanded="true">
                     <span class="side-sec-caret">▾</span>
-                    <span class="side-sec-name">RAG (база знаний PDF)</span>
+                    <span class="side-sec-name">RAG (база знаний: PDF, docs, код)</span>
                 </button>
                 <div class="side-sec-body">
                     <div class="rag-box">
-                        <label class="rag-toggle" title="Подмешивать в промпт найденные фрагменты документов">
+                        <label class="rag-toggle" title="Подмешивать в промпт найденные фрагменты документов и кода">
                             <input type="checkbox" id="rag-enabled">
                             <span>Использовать RAG</span>
                         </label>
                         <label class="compact-label side-label">
-                            <span>папка с PDF</span>
+                            <span>docs:</span>
                             <input type="text" id="rag-docs-dir" class="gen-input rag-input"
-                                   placeholder="путь к папке с PDF" maxlength="400">
+                                   placeholder="путь к папке с PDF / проектом" maxlength="400">
                         </label>
                         <label class="compact-label side-label">
                             <span>фрагментов (top-k)</span>
@@ -253,7 +255,7 @@
                         </div>
                         <span id="rag-status" class="rag-status">RAG выключен</span>
                     </div>
-                                        <span class="side-note">модель эмбеддингов — Ollama nomic-embed-text-v2-moe; из PDF берётся только текст</span>
+                                        <span class="side-note">модель эмбеддингов — Ollama nomic-embed-text-v2-moe; индексируются PDF (текст), README/docs и код</span>
                 </div>
             </section>
 

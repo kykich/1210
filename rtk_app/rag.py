@@ -1,10 +1,12 @@
-"""RAG (Retrieval-Augmented Generation) поверх локальных PDF-документов.
+"""RAG (Retrieval-Augmented Generation) поверх PDF и документов/кода проекта.
 
 Назначение
 ----------
-Дать агенту доступ к БАЗЕ ЗНАНИЙ из PDF-файлов: документы индексируются
-(текстовый слой -> чанки -> эмбеддинги), а при запросе в чат выполняется
-ПОИСК по индексу и найденный контекст ПОДМЕШИВАЕТСЯ в промпт модели.
+Дать агенту доступ к БАЗЕ ЗНАНИЙ: PDF-документы И текстовые файлы проекта
+(README.md, папка docs/, исходники .py/.js/.css и т.п.) индексируются
+(текст -> чанки -> эмбеддинги), а при запросе в чат выполняется ПОИСК по
+индексу и найденный контекст ПОДМЕШИВАЕТСЯ в промпт модели (см.
+docs/Final_task.md, задача 1: ассистент разработчика и команда /help).
 
 Режим работы — A2 (см. переписку/план): при ВКЛЮЧЁННОМ RAG поиск выполняется
 ВСЕГДА, найденный контекст добавляется в системный промпт. Модель не
@@ -16,8 +18,10 @@
 ----------
   * эмбеддинги  — ЛОКАЛЬНАЯ модель Ollama nomic-embed-text-v2-moe
                    (POST /api/embeddings, dim=768, контекст 512 токенов);
-  * извлечение  — pypdf, ТОЛЬКО текстовый слой (графику игнорируем, OCR не
-                   нужен: PDF сконвертированы из Word и имеют текстовый слой);
+  * извлечение  — PDF: pypdf, ТОЛЬКО текстовый слой (графику игнорируем, OCR
+                   не нужен: PDF сконвертированы из Word и имеют текстовый
+                   слой); текстовые файлы: чтение UTF-8/cp1251 без страниц
+                   (page=0, id вида README.md#chunk.3);
   * хранилище   — SQLite (session/rag_index.db): таблица chunks с текстом
                    и вектором (BLOB float32). JSON — только для настроек
                    и метаданных (session/rag.json).
@@ -48,6 +52,8 @@ __all__ = [
     "tokenize_ru",
     "lexical_score",
     "hybrid_score",
+    "extract_pdf_text",
+    "extract_text_file",
     "extract_pdf_images",
 ]
 
@@ -157,6 +163,23 @@ def _unpack_vector(blob, dim):
     if dim and count != dim:
         count = min(count, dim)
     return list(struct.unpack("<%df" % count, blob[:count * 4]))
+
+
+def _under_root(path, root):
+    """True, если путь лежит ВНУТРИ root (регистр не важен на Windows).
+
+    Используется для ограничения поиска текущей папкой документов: в одном
+    индексе могут остаться чанки других проектов (переиндексация не удаляет
+    файлы, которых больше нет в папке), и они не должны попадать в ответ.
+    """
+    try:
+        p = os.path.normcase(os.path.abspath(str(path or "")))
+        r = os.path.normcase(os.path.abspath(str(root or "")))
+    except (TypeError, ValueError, OSError):
+        return True
+    if not r:
+        return True
+    return p == r or p.startswith(r + os.sep)
 
 
 def _cosine(a, b):
@@ -326,6 +349,63 @@ def extract_pdf_text(path, max_mb=None):
     if not any(p.strip() for p in pages):
         return [], "PDF без текстового слоя"
     return pages, None
+
+
+def extract_text_file(path, max_mb=None):
+    """Читает ТЕКСТОВЫЙ файл проекта (README, docs/*.md, исходники).
+
+    Возвращает (text, error):
+      text  — содержимое файла (строка), либо "";
+      error — причина пропуска (нет файла, слишком большой, не читается).
+
+    Кодировка: UTF-8, при ошибке — cp1251 (типичные файлы Windows),
+    затем latin-1 как последний резерв. Номеров страниц у текстовых
+    файлов нет: в индекс они попадают с page=0.
+    """
+    limit_mb = max_mb or getattr(config, "RAG_DOC_MAX_MB", 2)
+    try:
+        size_mb = os.path.getsize(path) / (1024.0 * 1024.0)
+    except OSError as exc:
+        return "", "не удалось прочитать файл: %s" % exc
+    if size_mb > limit_mb:
+        return "", "файл больше %d МБ (%.1f МБ) — пропущен" % (
+            limit_mb, size_mb)
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        return "", "не удалось прочитать файл: %s" % exc
+    for enc in ("utf-8-sig", "cp1251", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    else:                                        # pragma: no cover
+        return "", "не удалось определить кодировку"
+    text = _clean_text(text)
+    if not text.strip():
+        return "", "пустой файл"
+    return text, None
+
+
+def is_pdf(path):
+    """True, если файл индексируется как PDF (текстовый слой + картинки)."""
+    return str(path or "").lower().endswith(".pdf")
+
+
+def doc_extensions():
+    """Расширения индексируемых файлов (из конфига, с ведущей точкой)."""
+    exts = getattr(config, "RAG_DOC_EXTS", None) or (".pdf",)
+    out = []
+    for e in exts:
+        e = str(e or "").strip().lower()
+        if not e:
+            continue
+        if not e.startswith("."):
+            e = "." + e
+        out.append(e)
+    return tuple(out)
 
 
 # ----------------------------------------------------------------------
@@ -690,24 +770,44 @@ class RagStore(object):
         return s
 
     # ---- (пере)индексация ----
-    def _pdf_files(self, docs_dir):
-        """Список PDF-файлов в папке (рекурсивно), отсортированный."""
+    def _doc_files(self, docs_dir):
+        """Список индексируемых файлов в папке (рекурсивно), отсортированный.
+
+        Берутся PDF и текстовые файлы/код из config.RAG_DOC_EXTS.
+        Служебные папки (config.RAG_DOC_SKIP_DIRS: .git, session,
+        __pycache__, node_modules и т.п.) и любые скрытые папки пропускаются.
+        """
         out = []
         if not docs_dir or not os.path.isdir(docs_dir):
             return out
-        for root, _dirs, names in os.walk(docs_dir):
-            for name in names:
-                if name.lower().endswith(".pdf"):
+        exts = doc_extensions()
+        skip = set(str(d).lower()
+                   for d in getattr(config, "RAG_DOC_SKIP_DIRS", ()))
+        skip_files = set(str(f).lower()
+                         for f in getattr(config, "RAG_DOC_SKIP_FILES", ()))
+        for root, dirs, names in os.walk(docs_dir):
+            dirs[:] = sorted(d for d in dirs
+                             if d.lower() not in skip and not d.startswith("."))
+            for name in sorted(names):
+                if name.lower() in skip_files:
+                    continue
+                if name.lower().endswith(exts):
                     out.append(os.path.join(root, name))
         out.sort()
         return out
 
-    def index_docs(self, docs_dir=None, verbose=True):
-        """Полная (пере)индексация папки с PDF.
+    def _pdf_files(self, docs_dir):
+        """Список только PDF-файлов (совместимость; см. _doc_files)."""
+        return [p for p in self._doc_files(docs_dir) if is_pdf(p)]
 
-        Перебирает PDF, для неизменённых (mtime+size) — пропускает, для
-        остальных: извлекает текст -> режет на чанки -> считает эмбеддинги ->
-        пишет в SQLite. Возвращает отчёт {ok, files, chunks, skipped, errors}.
+    def index_docs(self, docs_dir=None, verbose=True):
+        """Полная (пере)индексация папки с документами, кодом и PDF.
+
+        Перебирает файлы из config.RAG_DOC_EXTS (PDF — текстовый слой и
+        картинки; .md/.txt/.py/.js/... — как текст), для неизменённых
+        (mtime+size) — пропускает, для остальных: текст -> чанки ->
+        эмбеддинги -> SQLite. Возвращает отчёт {ok, files, chunks, skipped,
+        errors}.
         """
         if not _index_lock.acquire(blocking=False):
             return {"ok": False, "error": "индексация уже выполняется"}
@@ -718,7 +818,7 @@ class RagStore(object):
                 return {"ok": False,
                         "error": "папка не найдена: %s" % docs_dir}
             conn = self._conn()
-            files = self._pdf_files(docs_dir)
+            files = self._doc_files(docs_dir)
             report = {"ok": True, "docs_dir": docs_dir, "files": 0,
                       "chunks": 0, "skipped": 0, "unchanged": 0,
                       "images": 0, "errors": [],
@@ -744,34 +844,46 @@ class RagStore(object):
                     # ПОСЛЕ первой индексации (функция добавлена позже)
                     # или прежняя индексация прошла без извлечения.
                     # Дозаполняем таблицу images, если для файла пусто.
-                    try:
-                        have = conn.execute(
-                            "SELECT COUNT(*) FROM images WHERE file=?",
-                            (path,)).fetchone()
-                        if not (have and int(have[0] or 0)):
-                            report["images"] += self._store_images(conn, path)
-                    except Exception as exc:                 # noqa: BLE001
-                        report["errors"].append(
-                            "%s: изображения: %s"
-                            % (os.path.basename(path), exc))
+                    # Картинки есть только у PDF: текстовые файлы пропускаем.
+                    if is_pdf(path):
+                        try:
+                            have = conn.execute(
+                                "SELECT COUNT(*) FROM images WHERE file=?",
+                                (path,)).fetchone()
+                            if not (have and int(have[0] or 0)):
+                                report["images"] += self._store_images(conn,
+                                                                       path)
+                        except Exception as exc:             # noqa: BLE001
+                            report["errors"].append(
+                                "%s: изображения: %s"
+                                % (os.path.basename(path), exc))
                     continue
-                pages, err = extract_pdf_text(path)
+                pdf = is_pdf(path)
+                if pdf:
+                    pages, err = extract_pdf_text(path)
+                    first_page = 1
+                else:
+                    text, err = extract_text_file(path)
+                    pages = [text] if text else []
+                    first_page = 0
                 if err:
                     # Помечаем файл с ошибкой, старые чанки удаляем.
                     report["errors"].append("%s: %s"
                                             % (os.path.basename(path), err))
                     self._replace_file(conn, path, mtime, size, [], 0, err)
-                    # Изображения могли извлечься даже без текста.
-                    self._store_images(conn, path)
+                    # Изображения могли извлечься даже без текста (PDF).
+                    if pdf:
+                        self._store_images(conn, path)
                     report["skipped"] += 1
                     continue
-                chunks = self._file_chunks(pages)
+                chunks = self._file_chunks(pages, first_page=first_page)
                 if not chunks:
                     report["errors"].append(
                         "%s: нет текста" % os.path.basename(path))
                     self._replace_file(conn, path, mtime, size, [], 0,
                                        "нет текста")
-                    self._store_images(conn, path)
+                    if pdf:
+                        self._store_images(conn, path)
                     report["skipped"] += 1
                     continue
                 vectors = []
@@ -792,7 +904,8 @@ class RagStore(object):
                     break
                 self._replace_file(conn, path, mtime, size, chunks, vectors,
                                    None)
-                report["images"] += self._store_images(conn, path)
+                if pdf:
+                    report["images"] += self._store_images(conn, path)
                 report["files"] += 1
                 report["chunks"] += len(chunks)
                 if verbose:
@@ -805,12 +918,19 @@ class RagStore(object):
             _index_lock.release()
 
     @staticmethod
-    def _file_chunks(pages):
-        """Превращает страницы PDF в список чанков {page, chunk, text}."""
+    def _file_chunks(pages, first_page=1):
+        """Превращает страницы документа в список чанков.
+
+        pages      — список текстов (для PDF — по страницам, для текстовых
+                     файлов — один элемент со всем содержимым);
+        first_page — номер первой страницы: 1 для PDF, 0 для текстовых
+                     файлов (у них страниц нет, id будет без «стр.N»).
+        """
         out = []
         for pi, page_text in enumerate(pages):
             for ci, piece in enumerate(chunk_text(page_text)):
-                out.append({"page": pi + 1, "chunk": ci + 1, "text": piece})
+                out.append({"page": pi + first_page,
+                            "chunk": ci + 1, "text": piece})
         return out
 
     @staticmethod
@@ -1073,6 +1193,9 @@ class RagStore(object):
         queries — список строк (оригинал + переформулировки от LLM). Пустые — отбрасываются.
         Скор чанка — лучший по всем формулировкам. Кандидаты ниже
         min_score отбрасываются, остальные сортируются и режутся по top_k.
+
+        docs_dir — ОГРАНИЧЕНИЕ ОБЛАСТИ ПОИСКА: если задан, учитываются только
+        чанки файлов внутри этой папки. Без него ищем по всему индексу.
         """
         qs = [str(q).strip() for q in (queries or []) if str(q).strip()]
         if not qs:
@@ -1084,6 +1207,8 @@ class RagStore(object):
         conn = self._conn()
         rows = conn.execute(
             "SELECT file, page, chunk, text, vec FROM chunks").fetchall()
+        if docs_dir and str(docs_dir).strip():
+            rows = [r for r in rows if _under_root(r[0], docs_dir)]
         if not rows:
             return []
         pool = max(1, k * max(1, pool_mult))
@@ -1233,21 +1358,26 @@ def format_citation_id(file, page, chunk):
     return base + "#" + "/".join(parts)
 
 
-def format_sources(hits):
+def format_sources(hits, docs_dir=None):
     """Собирает УНИКАЛЬНЫЕ источники из результатов поиска RAG.
 
     На вход — список фрагментов (hits) из RagStore.search/build_context,
     каждый вида {"file", "page", "chunk", "score", ...}. Возвращает список
-    словарей {file, doc, pages}, где:
-      * file  — имя PDF-файла (без пути) — по нему открывается документ;
+    словарей {file, doc, path, pages, citations}, где:
+      * file  — имя файла (без пути) — для показа и совместимости;
       * doc   — имя файла без расширения (для показа);
-      * pages — отсортированный список страниц, где встречается фрагмент.
+      * path  — путь ОТНОСИТЕЛЬНО docs_dir (например, "docs/REPORT.md" или
+                "rtk_app/rag.py"); по нему сервер отдаёт документ из /docs/.
+                Если docs_dir не задан или файл вне него — равен file;
+      * pages — отсортированный список страниц (у текстовых файлов пустой);
+      * citations — идентификаторы фрагментов вида <файл>#стр.P/chunk.C.
 
     Один и тот же файл показывается один раз, а страницы объединяются.
     Порядок — по максимальной релевантности (лучший score сверху).
     """
     order = []          # порядок вывода файлов (по лучшему score)
-    by_file = {}        # file -> {"doc", "pages", "best", "citations"}
+    by_file = {}        # file -> {"doc", "path", "pages", "best", "citations"}
+    root = str(docs_dir or "").strip()
     for h in hits or []:
         if not isinstance(h, dict):
             continue
@@ -1255,6 +1385,15 @@ def format_sources(hits):
         if not full:
             continue
         base = os.path.basename(full)
+        rel = base
+        if root:
+            try:
+                cand = os.path.relpath(full, root)
+                cand = cand.replace(os.sep, "/")
+                if not cand.startswith(".."):
+                    rel = cand
+            except (ValueError, OSError):
+                rel = base
         try:
             page = int(h.get("page") or 0)
         except (TypeError, ValueError):
@@ -1269,7 +1408,7 @@ def format_sources(hits):
             score = 0.0
         item = by_file.get(base)
         if item is None:
-            item = {"doc": os.path.splitext(base)[0],
+            item = {"doc": os.path.splitext(base)[0], "path": rel,
                     "pages": set(), "best": score, "citations": []}
             by_file[base] = item
             order.append(base)
@@ -1289,6 +1428,7 @@ def format_sources(hits):
         out.append({
             "file": base,
             "doc": item["doc"],
+            "path": item["path"],
             "pages": sorted(item["pages"]),
             "citations": sorted(item["citations"]),
         })

@@ -1641,7 +1641,11 @@ import { apiGet, apiPost } from "./core/api.js";
         var compositionActive = !!(mcpState && mcpState.composition);
         var mcpReady = compositionActive || doskaSelected ||
             !!(mcpState && mcpState.enabled && (mcpState.model || mcpState.available));
-        if (!hasActiveProfile() && !hasSelectedModel() && !mcpReady) {
+        // КОМАНДА /help (ассистент разработчика): работает без выбранной
+        // модели/персоны — сервер вернёт детерминированную справку о проекте
+        // (git-ветка, структура, найденные фрагменты документации/кода).
+        var isHelp = /^\s*\/help\b/i.test(question);
+        if (!isHelp && !hasActiveProfile() && !hasSelectedModel() && !mcpReady) {
             setStatus("Выберите модель или создайте персону.", "error");
             return;
         }
@@ -2115,9 +2119,10 @@ import { apiGet, apiPost } from "./core/api.js";
 
 
     // ------------------------------------------------------------------
-    // RAG (Retrieval-Augmented Generation) — база знаний из PDF
+    // RAG (Retrieval-Augmented Generation) — база знаний из документации,
+    // кода и PDF
     // ------------------------------------------------------------------
-    // Кнопки/поля блока RAG: чекбокс включения, путь к папке с PDF,
+    // Кнопки/поля блока RAG: чекбокс включения, путь к папке с документами,
     // число фрагментов (top-k), кнопки «Переиндексировать», «Проверить»
     // (доступность модели эмбеддингов Ollama) и «Очистить» индекс.
     // Настройки и статистика хранятся на сервере (GET/POST /api/rag).
@@ -2289,10 +2294,10 @@ import { apiGet, apiPost } from "./core/api.js";
         ragReindexBtn.addEventListener("click", function () {
             ragReindexBtn.disabled = true;
             if (ragStatusEl) {
-                ragStatusEl.textContent = "индексирую PDF… (может занять время)";
+                ragStatusEl.textContent = "индексирую документы и код… (может занять время)";
                 ragStatusEl.className = "rag-status warn";
             }
-            setStatus("RAG: индексация PDF…", "");
+            setStatus("RAG: индексация документов и кода…", "");
             ragAction("reindex", null, function (d) {
                 ragReindexBtn.disabled = false;
                 var rep = (d && d.report) || {};

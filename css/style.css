@@ -1527,7 +1527,7 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
     cursor: pointer;
 }
 .rag-toggle input { cursor: pointer; width: auto; }
-/* Строки «папка с PDF» / «фрагментов»: подпись + поле в столбец. */
+/* Строки «папка с документами» / «фрагментов»: подпись + поле в столбец. */
 .rag-box .side-label {
     display: flex;
     flex-direction: column;

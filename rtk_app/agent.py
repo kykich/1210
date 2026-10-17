@@ -19,7 +19,30 @@ from datetime import datetime, timedelta
 from . import rag_llm
 from . import config, deepseek, gigachat, html_report, local_llm
 
-__all__ = ["Agent"]
+__all__ = ["Agent", "GIT_TOOLS", "apply_tool_defaults"]
+
+# Git-инструменты MCP-сервера «Проект»: им сервер подставляет ЦЕЛЕВУЮ папку
+# RAG (docs_dir), чтобы git_status/git_diff/list_files не уходили в репозиторий
+# ассистента. Явно переданный аргумент repo всегда имеет приоритет.
+GIT_TOOLS = frozenset(("git_branch", "git_status", "git_diff", "list_files"))
+
+
+def apply_tool_defaults(tool_name, arguments, defaults=None):
+    """Дополняет аргументы MCP-инструмента значениями по умолчанию.
+
+    defaults — например {"repo": "<папка RAG>"}. Подставляется ТОЛЬКО
+    git-инструментам (GIT_TOOLS) и только если аргумент не задан или пуст:
+    явно указанный repo сохраняется.
+    """
+    args = dict(arguments or {})
+    if not defaults or tool_name not in GIT_TOOLS:
+        return args
+    for key, value in (defaults or {}).items():
+        if value in (None, ""):
+            continue
+        if not args.get(key):
+            args[key] = value
+    return args
 
 
 def json_dumps_safe(obj):
@@ -690,10 +713,15 @@ class Agent:
         return "\n".join(lines)
 
     def answer_via_mcp(self, question, tools, model=None, temperature=None,
-                       max_tokens=None, server_id=None):
+                       max_tokens=None, server_id=None, tool_defaults=None):
         """Отвечает на запрос через MCP: модель выбирает инструмент и аргументы,
         затем инструмент вызывается на MCP-сервере, а его результат возвращается
         как ответ.
+
+        tool_defaults — значения аргументов по умолчанию для git-инструментов
+        (например, {"repo": "<целевая папка RAG>"}), чтобы git_status/diff/
+        list_files работали с проиндексированным проектом, а не с репозиторием
+        ассистента.
 
         Возвращает dict того же вида, что и answer(): ok/html/text/answers/meta/
         usage/trace/memory_used (+ mcp — детали вызова).
@@ -739,7 +767,11 @@ class Agent:
 
         decision = self._parse_mcp_decision(single["content"])
         tool_name = (decision or {}).get("tool")
-        args = (decision or {}).get("arguments") or {}
+        # Целевая папка RAG подставляется в аргументы git-инструментов
+        # (repo=...), иначе они работают с репозиторием ассистента.
+        args = apply_tool_defaults(tool_name,
+                                   (decision or {}).get("arguments"),
+                                   tool_defaults)
 
         # 2a) Инструмент не выбран — отдаём прямой ответ модели.
         if not tool_name:
@@ -1596,10 +1628,13 @@ class Agent:
     def _render_sources_html(rag_sources):
         """HTML-блок «Источники» (из RAG) для карточки ответа (или "").
 
-        rag_sources — список {file, doc, pages} (см. rag.format_sources).
-        Каждый источник — кликабельная ссылка на PDF-файл (открывается в
-        новой вкладке) со списком страниц. Барабан безопасен: имена файлов
-        и номера страниц экранируются. Пустой список → "" (блок не выводим).
+        rag_sources — список {file, doc, path, pages} (см. rag.format_sources).
+        Каждый источник — кликабельная ссылка на документ (PDF/README/.md/код,
+        открывается в новой вкладке) со списком страниц. Ссылка строится по
+        относительному пути (path), чтобы работали вложенные файлы
+        (docs/REPORT.md, rtk_app/rag.py); для старых источников без path
+        используется имя файла. Вывод безопасен: имена и страницы
+        экранируются. Пустой список → "" (блок не выводим).
         """
         items = [s for s in (rag_sources or []) if isinstance(s, dict)
                  and str(s.get("file") or "").strip()]
@@ -1609,14 +1644,15 @@ class Agent:
         for s in items:
             file_name = str(s.get("file")).strip()
             doc = str(s.get("doc") or file_name).strip()
+            link_name = str(s.get("path") or file_name).strip()
             pages = s.get("pages") or []
             try:
                 pages = sorted({int(p) for p in pages if int(p) > 0})
             except (TypeError, ValueError, OverflowError):
                 pages = []
-            # Ссылка на документ: /docs/<file> (обработчик отдаёт PDF из
-            # папки RAG). Имя файла кодируем в URL.
-            href = "/docs/%s" % urllib.parse.quote(file_name)
+            # Ссылка на документ: /docs/<path> (обработчик отдаёт файл из
+            # папки RAG — PDF, README.md или исходник). Путь кодируем в URL.
+            href = "/docs/%s" % urllib.parse.quote(link_name)
             page_note = (", стр. %s" % ", ".join(str(p) for p in pages)) \
                 if pages else ""
             # Идентификаторы section/chunk_id фрагментов этого документа

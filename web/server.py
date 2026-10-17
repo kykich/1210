@@ -18,8 +18,8 @@
 JSON-API:
     GET  /                  - страница (index.html)
     GET  /css/*,/js/*       - стили и скрипты
-    GET  /docs/<file>       - PDF-документ из папки RAG (для ссылок
-                              «Источники» в карточке ответа)
+    GET  /docs/<file>       - документ из папки RAG (PDF, README.md,
+                              исходник) для ссылок «Источники» в карточке
     GET  /api/model         - список моделей, которые обслуживает агент
     GET  /api/session       - сохранённая история + стратегия + facts + ветки
     POST /api/ask           - {question, models[], max_tokens?, compact?,
@@ -80,13 +80,16 @@ JSON-API:
     GET  /api/rag           - состояние RAG: {enabled, docs_dir, top_k,
                               embed_model, files, chunks, available, errors}
     POST /api/rag           - {action, …} -> RAG (Retrieval-Augmented
-                              Generation) поверх PDF-документов:
+                              Generation) поверх PDF, документации и кода:
                               "state"   — вернуть состояние (по умолч.);
                               "set"     — сохранить {enabled?, docs_dir?,
                                           top_k?} (настраиваемый путь к
-                                          папке PDF + число фрагментов);
-                              "reindex" — (пере)индексировать PDF: текст ->
-                                          чанки -> эмбеддинги (Ollama
+                                          папке с документами + число
+                                          фрагментов);
+                              "reindex" — (пере)индексировать папку:
+                                          PDF (текстовый слой), README/docs
+                                          и исходники -> чанки ->
+                                          эмбеддинги (Ollama
                                           nomic-embed-text-v2-moe) -> SQLite;
                               "clear"   — очистить индекс;
                               "check"   — проверить модель эмбеддингов.
@@ -116,6 +119,7 @@ JSON-API:
 import json
 import mimetypes
 import os
+import re
 import webbrowser
 import threading
 import time
@@ -132,6 +136,103 @@ try:
     from rtk_app import mcp_client
 except Exception:  # pragma: no cover — зависит от окружения
     mcp_client = None
+
+
+# ----------------------------------------------------------------------
+# Команда /help (docs/Final_task.md, задача 1): ассистент разработчика
+# ----------------------------------------------------------------------
+# /help <вопрос> — ответ о проекте с опорой на документацию и код (RAG)
+# и на сведения из git (MCP-сервер «Проект»). Команда работает и без
+# выбранной модели: тогда возвращается детерминированная справка.
+_HELP_RE = re.compile(r"^\s*/help\b[:\s]*(.*)$", re.IGNORECASE | re.DOTALL)
+_HELP_DEFAULT_QUESTION = (
+    "Расскажи о структуре проекта: назначение, основные модули и где "
+    "лежит документация.")
+# Сколько фрагментов показывать в справке без модели.
+_HELP_HITS_PREVIEW = 5
+# Сколько символов текста фрагмента выводить в справке.
+_HELP_HIT_CHARS = 160
+# Заглушка, если в целевой папке нет git-данных (не репозиторий).
+NO_GIT_TEXT = "Нет данных о GIT"
+
+
+def parse_help(question):
+    """Возвращает текст запроса после /help или None (не команда /help)."""
+    match = _HELP_RE.match(str(question or ""))
+    if not match:
+        return None
+    return (match.group(1) or "").strip()
+
+
+def project_git_note(docs_dir=None, timeout=15):
+    """Сведения о git-ветке через MCP-сервер «Проект».
+
+    docs_dir — папка проиндексированных документов: если она (или её предок)
+    является git-репозиторием, берём ветку ИМЕННО этого репозитория.
+    Если git-данных в папке нет — возвращается заглушка «Нет данных о GIT»,
+    БЕЗ подмены веткой проекта ассистента.
+    """
+    if mcp_client is None:
+        return NO_GIT_TEXT
+
+    def _call(args):
+        try:
+            res = mcp_client.mcp_call_tool("git_branch", args, timeout=timeout,
+                                           server_id="project")
+        except Exception as exc:                 # noqa: BLE001
+            print("[HELP] git-инструмент недоступен: %s" % exc, flush=True)
+            return ""
+        if not res.get("ok"):
+            return ""
+        return str(res.get("text") or "").strip()
+
+    root = str(docs_dir or "").strip()
+    if not root:
+        return _call({})
+    text = _call({"repo": root})
+    if not text or text.startswith(NO_GIT_TEXT) or text.startswith("Ошибка"):
+        return NO_GIT_TEXT
+    return text
+
+
+def project_brief(root=None):
+    """Краткая структура проекта (верхний уровень + docs) для /help.
+
+    root — папка проиндексированных документов; если она существует,
+    структура берётся из неё (актуально, когда проиндексирован ДРУГОЙ
+    проект). По умолчанию — корень проекта ассистента.
+    """
+    base = getattr(config, "BASE_DIR", os.getcwd())
+    root = str(root or "").strip() or base
+    if not os.path.isdir(root):
+        root = base
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return ""
+    # Секретные файлы (ключи API) и служебные папки в справке не показываем.
+    skip_files = set(str(f).lower()
+                     for f in getattr(config, "RAG_DOC_SKIP_FILES", ()))
+    skip_dirs = {"__pycache__", "session", "node_modules", "rag_images"}
+    dirs = [n for n in names if os.path.isdir(os.path.join(root, n))
+            and not n.startswith(".") and n.lower() not in skip_dirs]
+    files = [n for n in names if os.path.isfile(os.path.join(root, n))
+             and not n.startswith(".") and n.lower() not in skip_files]
+    parts = []
+    if dirs:
+        parts.append("папки: " + ", ".join(dirs) + "/")
+    if files:
+        parts.append("файлы: " + ", ".join(files))
+    docs = os.path.join(root, "docs")
+    if os.path.isdir(docs):
+        try:
+            md = sorted(n for n in os.listdir(docs) if n.lower().endswith(
+                (".md", ".txt", ".rst")))
+        except OSError:
+            md = []
+        if md:
+            parts.append("документация docs/: " + ", ".join(md))
+    return "\n".join(parts)
 
 
 class _ServerState:
@@ -686,8 +787,9 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         if path.startswith(("/css/", "/js/")):
             return self._serve_static_safe(path.lstrip("/"))
         if path.startswith("/docs/"):
-            # Отдача PDF-документа из папки RAG по имени файла — для ссылок
-            # «Источники» в карточке ответа (см. agent._render_sources_html).
+            # Отдача документа из папки RAG (PDF, .md, исходник) по пути —
+            # для ссылок «Источники» в карточке ответа (см.
+            # agent._render_sources_html).
             return self._serve_rag_doc(path[len("/docs/"):])
         if path.startswith("/images/"):
             # Отдача ИЗОБРАЖЕНИЯ из хранилища RAG (встроенные картинки PDF) —
@@ -799,6 +901,13 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         if not os.path.isfile(full):
             return self._send_bytes(404, "Not Found", "text/plain")
         ctype, _ = mimetypes.guess_type(full)
+        # Текстовые источники (README.md, docs/*.md, исходники проекта)
+        # отдаём как text/plain с UTF-8: браузер покажет содержимое, а не
+        # скачает файл.
+        text_exts = (".md", ".mdx", ".rst", ".txt", ".py", ".js", ".css",
+                     ".json", ".yml", ".yaml", ".toml", ".html", ".htm")
+        if str(full).lower().endswith(text_exts):
+            ctype = "text/plain; charset=utf-8"
         with open(full, "rb") as f:
             body = f.read()
         self.send_response(200)
@@ -866,6 +975,66 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             # Сжатие не должно ломать основной запрос.
             print("[COMPACT] сжатие не удалось: %s" % exc, flush=True)
 
+    def _help_payload(self, question, git_note, rag_hits, docs_dir=None):
+        """Детерминированный ответ на /help (БЕЗ вызова LLM).
+
+        Возвращает текст со сведениями о проекте: git-ветка (MCP), структура
+        каталогов, состояние RAG-индекса и найденные фрагменты документации
+        и кода. Используется, когда модель/персона не выбраны.
+        """
+        from rtk_app import rag as rag_mod
+        lines = ["/help — справка о проекте (модель не вызывалась)", ""]
+        lines.append("Вопрос: %s" % question)
+        lines.append("")
+        if git_note:
+            lines.append("Git:")
+            lines.append(git_note)
+            lines.append("")
+        brief = project_brief(docs_dir)
+        if brief:
+            lines.append("Структура проекта:")
+            lines.append(brief)
+            lines.append("")
+        try:
+            status = self.session.rag_status()
+        except Exception:                            # noqa: BLE001
+            status = {}
+        lines.append("База знаний RAG: файлов %s, фрагментов %s (индекс %s)."
+                     % (status.get("files", 0), status.get("chunks", 0),
+                        "доступен" if status.get("available") else "пуст"))
+        if rag_hits:
+            lines.append("")
+            lines.append("Найденные фрагменты документации/кода:")
+            for h in list(rag_hits)[:_HELP_HITS_PREVIEW]:
+                cid = rag_mod.format_citation_id(h.get("file"), h.get("page"),
+                                                 h.get("chunk"))
+                text = " ".join(str(h.get("text") or "").split())
+                if len(text) > _HELP_HIT_CHARS:
+                    text = text[:_HELP_HIT_CHARS] + "…"
+                lines.append("- %s (score %.3f): %s"
+                             % (cid or os.path.basename(
+                                 str(h.get("file") or "")),
+                                float(h.get("score") or 0), text))
+        else:
+            lines.append("")
+            lines.append("Фрагментов по вопросу не найдено — уточните вопрос "
+                         "или переиндексируйте папку с документацией.")
+        lines.append("")
+        lines.append("Подсказка: выберите модель или создайте персону — тогда "
+                     "/help ответит развёрнуто с опорой на найденный контекст.")
+        return {
+            "ok": True,
+            "help": True,
+            "text": "\n".join(lines),
+            "html": "",
+            "answers": [],
+            "usage": None,
+            "context": {},
+            "rag_sources": [],
+            "rag_fragments": [],
+            "rag_low_relevance": False,
+        }
+
     def _handle_ask(self):
         """Принимает запрос пользователя и передаёт его агенту.
 
@@ -882,6 +1051,15 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         selected = data.get("models")
         if not isinstance(selected, list) or not selected:
             selected = None
+
+        # КОМАНДА /help (docs/Final_task.md, задача 1): ассистент разработчика.
+        # Вопрос после /help ищется по README/docs/коду (RAG) с добавлением
+        # сведений о git-ветке (MCP «Проект»). Без выбранной модели/персоны
+        # возвращается детерминированная справка — без вызова LLM.
+        help_query = parse_help(question)
+        is_help = help_query is not None
+        if is_help:
+            question = help_query or _HELP_DEFAULT_QUESTION
 
         # «ДОСКА» — особый сервер ВЫВОДА: запрос к ней обрабатывается через
         # MCP-путь (с предварительным обновлением данных композицией) и
@@ -904,6 +1082,11 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         # ВАЖНО: сам ФАКТ выбора сервера в списке (без чекбокса и без
         # композиции) НЕ включает MCP-режим.
         via_mcp = bool(_ServerState.mcp_enabled or target_is_board)
+        # ВАЖНО: /help — ЯВНАЯ команда ассистента разработчика. Она не должна
+        # перехватываться MCP-режимом, «Доской» или композицией: иначе вместо
+        # справки по проекту вернётся таблица MCP-сервера.
+        if is_help:
+            via_mcp = False
 
         # РЕЖИМ ОТВЕТА зависит от наличия персон:
         #   * ЕСТЬ активная персона — отвечает ПЕРСОНА, используя СВОЮ модель
@@ -928,7 +1111,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             # Персон нет (или запрос идёт через MCP) — режим «напрямую».
             answer_title = None
             profile = None
-            if selected is None and not via_mcp:
+            if selected is None and not via_mcp and not is_help:
                 return self._send_json(200, {
                     "ok": False,
                     "error": "Не выбрана ни одна модель. Включите модель для "
@@ -997,7 +1180,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                   flush=True)
 
         # RAG (Retrieval-Augmented Generation): при ВКЛЮЧЁННОМ RAG ищем
-        # релевантные фрагменты PDF-документов и подмешиваем их в промпт
+        # релевантные фрагменты документов и кода и подмешиваем их в промпт
         # (режим A2 — поиск всегда, модель получает готовый контекст).
         # Ошибки поиска (Ollama недоступна и т.п.) не ломают ответ модели.
         #
@@ -1006,9 +1189,11 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         # зависит от LLM. RagStore делает «чистую» часть: гибридный поиск,
         # порог, пул кандидатов, а также вызывает переданные сюда callback-и.
         rag_set = self.session.rag_settings()
+        rag_docs_dir = rag_set.get("docs_dir") or config.RAG_DOCS_DIR
         rag_queries = None            # формулировки запроса (rewrite)
         rag_rerank_fn = None          # callback LLM-реранкера
-        if rag_set.get("enabled"):
+        help_git_note = ""            # сведения о git для /help
+        if rag_set.get("enabled") and not is_help:
             # Query rewrite: расширяем запрос синонимами/терминами через LLM.
             if rag_set.get("rewrite") and self.agent is not None:
                 try:
@@ -1024,8 +1209,26 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             if (rag_set.get("rerank") == "llm" and self.agent is not None):
                 def rag_rerank_fn(query, hits, _agent=self.agent):
                     return _agent.rag_rerank(query, hits)
-        rag_context, rag_hits = self.session.rag_context(
-            question, queries=rag_queries, rerank_fn=rag_rerank_fn)
+        if is_help:
+            # /help: ищем по документации и коду ВСЕГДА (даже если RAG
+            # выключен) и добавляем сведения о git-ветке из MCP-сервера
+            # «Проект». Rewrite/реранкер здесь не нужны — справка должна
+            # быть быстрой и предсказуемой.
+            rag_context, rag_hits = "", []
+            try:
+                if self.session.rag.status().get("available"):
+                    rag_context, rag_hits = self.session.rag.build_context(
+                        question, top_k=rag_set.get("top_k"),
+                        docs_dir=rag_docs_dir)
+            except Exception as exc:             # noqa: BLE001
+                print("[HELP] RAG-поиск не выполнен: %s" % exc, flush=True)
+            help_git_note = project_git_note(rag_docs_dir)
+            if help_git_note:
+                rag_context = ("СВЕДЕНИЯ О ПРОЕКТЕ (git):\n" + help_git_note
+                               + ("\n\n" + rag_context if rag_context else ""))
+        else:
+            rag_context, rag_hits = self.session.rag_context(
+                question, queries=rag_queries, rerank_fn=rag_rerank_fn)
                 # НИЗКАЯ РЕЛЕВАНТНОСТЬ: RAG включён И индекс доступен (есть чанки),
         # но ни один фрагмент не прошёл порог (rag_hits пуст) — ассистент
         # ОБЯЗАН сказать «не знаю» и попросить уточнение (детерминированно,
@@ -1037,7 +1240,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         except Exception:                        # noqa: BLE001
             rag_index_ok = False
         rag_low_relevance = (bool(rag_set.get("enabled")) and rag_index_ok
-                             and not rag_hits)
+                             and not rag_hits and not is_help)
         rag_sources = []
         # Фрагменты для карточки ответа: текст найденного чанка + картинки
         # соответствующей страницы (если из PDF извлечены изображения).
@@ -1051,7 +1254,8 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             # Уникальные источники (документ + страницы) для карточки ответа.
             try:
                 from rtk_app import rag as rag_mod
-                rag_sources = rag_mod.format_sources(rag_hits)
+                rag_sources = rag_mod.format_sources(rag_hits,
+                                                     docs_dir=rag_docs_dir)
                 if rag_sources:
                     print("[RAG] источников для карточки ответа: %d"
                           % len(rag_sources), flush=True)
@@ -1072,6 +1276,13 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         else:
             print("[RAG] контекст не добавлен (выключен или индекс пуст)",
                   flush=True)
+
+        # /help БЕЗ модели/персоны: детерминированная справка (git-ветка,
+        # структура проекта и найденные фрагменты документации/кода) —
+        # LLM не вызывается, ответ воспроизводим.
+        if is_help and not pid and selected is None and not via_mcp:
+            return self._send_json(200, self._help_payload(
+                question, help_git_note, rag_hits, rag_docs_dir))
 
         # НАПОМИНАНИЯ: АВТОМАТИЧЕСКИ забираем наступившие напоминания из
         # календаря (MCP-инструмент run_due) и доставляем их в чат ОТДЕЛЬНЫМ
@@ -1137,10 +1348,17 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                     print("[MCP] не удалось получить список инструментов: %s"
                           % listed.get("error"), flush=True)
             # Модель для MCP-запроса — из селекта «модель MCP».
+            # git-инструментам «Проекта» подставляем ЦЕЛЕВУЮ папку RAG
+            # (docs_dir), иначе git_status/git_diff/list_files смотрели бы
+            # репозиторий ассистента (1310), а не проиндексированный проект.
+            tool_defaults = None
+            if os.path.isdir(str(rag_docs_dir or "")):
+                tool_defaults = {"repo": str(rag_docs_dir)}
             result = self.agent.answer_via_mcp(
                 question, tools,
                 model=(_ServerState.mcp_model or None),
-                server_id=(_ServerState.mcp_server or None))
+                server_id=(_ServerState.mcp_server or None),
+                tool_defaults=tool_defaults)
         else:
             result = self.agent.answer(question, history, selected,
                                        max_tokens=max_tokens,

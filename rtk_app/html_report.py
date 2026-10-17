@@ -564,16 +564,36 @@ def apply_inline_markdown(text):
     настоящих тегов, поэтому подстановка не ломает уже сгенерированный код.
     Порядок: сначала код (чтобы звёздочки/подчёркивания внутри него не
     размечались), затем жирный, затем курсив.
+
+    ВАЖНО: содержимое inline-кода (`project_server.py`, `COMPOSITION_*`)
+    временно заменяется плейсхолдерами. Иначе регулярное выражение курсива
+    `_..._` «съедало» подчёркивания в именах файлов и превращало
+    `project_server.py` в `project<em>server.py`.
     """
-    # inline-код
-    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    codes = []
+
+    def _stash(match):
+        codes.append("<code>%s</code>" % match.group(1))
+        return "\x00CODE%d\x00" % (len(codes) - 1)
+
+    text = re.sub(r"`([^`]+)`", _stash, text)
     # жирный **text** / __text__
     text = re.sub(r"\*\*([^*]+?)\*\*", r"<strong>\1</strong>", text)
     text = re.sub(r"__([^_]+?)__", r"<strong>\1</strong>", text)
         # курсив *text* / _text_
     text = re.sub(r"\*([^*\n]+?)\*", r"<em>\1</em>", text)
     text = re.sub(r"_([^_\n]+?)_", r"<em>\1</em>", text)
-    return text
+
+    def _restore(match):
+        try:
+            idx = int(match.group(1))
+        except (TypeError, ValueError):
+            return match.group(0)
+        if 0 <= idx < len(codes):
+            return codes[idx]
+        return match.group(0)
+
+    return re.sub(r"\x00CODE(\d+)\x00", _restore, text)
 
 
 def parse_markdown_table_block(lines, start_idx):

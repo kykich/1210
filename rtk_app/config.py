@@ -194,6 +194,10 @@ MCP_SERVERS = [
      "args": ["zavhoz_server.py"]},
     {"id": "doska", "label": "Доска",
      "args": ["doska_server.py"]},
+    # --- Задача 1 (docs/Final_task.md): доступ ассистента к проекту ---
+    # git branch/status/diff и список файлов (только чтение, без записи).
+    {"id": "project", "label": "Проект (git)",
+     "args": ["project_server.py"]},
 ]
 # MCP-сервер по умолчанию (id из MCP_SERVERS).
 MCP_SERVER_DEFAULT = "calendar"
@@ -302,6 +306,31 @@ RAG_CTX_CAP = 6000
 RAG_MAX_PDF_MB = 100
 # Таймаут запроса к Ollama (секунд): эмбеддинги одного текста + прогрев модели.
 RAG_EMBED_TIMEOUT = 60
+
+# --- RAG: ДОКУМЕНТЫ И КОД ПРОЕКТА (docs/Final_task.md, задача 1) ---
+# Кроме PDF индексируются ТЕКСТОВЫЕ файлы: README, папка docs и исходники.
+# Для текстовых файлов номер страницы не имеет смысла — в индексе page=0,
+# а идентификатор источника выглядит как «README.md#chunk.3».
+RAG_DOC_EXTS = (
+    ".pdf",    # документы (текстовый слой, pypdf)
+    ".md", ".mdx", ".rst", ".txt",      # документация
+    ".py", ".js", ".css", ".html",      # исходный код проекта
+    ".json", ".yml", ".yaml", ".toml",  # конфигурация/схемы данных
+)
+# Максимальный размер индексируемого ТЕКСТОВОГО файла (МБ): защита от
+# случайной индексации гигантских логов/дампов.
+RAG_DOC_MAX_MB = 2
+# Папки, которые НЕ индексируются при обходе (служебные/бинарные/сессии).
+RAG_DOC_SKIP_DIRS = (
+    ".git", ".idea", ".vscode", ".venv", "venv", "env",
+    "node_modules", "__pycache__", "session", "rag_images",
+)
+# Файлы с СЕКРЕТАМИ: никогда не индексируются (ключи API лежат в корне
+# проекта и не должны попадать в базу знаний/ответы модели).
+RAG_DOC_SKIP_FILES = (
+    "apidpsk.txt", "gigakey.txt", "ya.txt", "exch.txt", "w.txt",
+    "weathe.txt",
+)
 
 
 # --- УЛУЧШЕННЫЙ ПОИСК RAG (2-й этап: фильтрация/реранкинг + query rewrite) ---
